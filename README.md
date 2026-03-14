@@ -19,9 +19,9 @@ A Chrome extension that intelligently shuffles your Suno liked songs with a pers
 
 ## Usage
 
-1. Go to [suno.com/me](https://suno.com/me) and open your **Liked** songs tab (or go to `/playlist/liked`).
+1. Go to [suno.com/playlist/liked](https://suno.com/playlist/liked).
 2. Click the Suno Shuffle icon in your Chrome toolbar.
-3. Click **Start Shuffle** — the extension will scan all your liked songs by auto-scrolling the page, then start playing.
+3. Click **Start Shuffle** — the extension will scan all your liked songs by auto-scrolling the page, then start playing. Note: it's better if you load the entire page yourself beforehand.
 4. Use the floating overlay to control playback from any suno.com page.
 
 ### Resuming after closing Chrome

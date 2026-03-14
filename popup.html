@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Suno Shuffle</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <div id="logo">♪</div>
+      <div id="branding">
+        <div id="app-name">Suno Shuffle</div>
+        <div id="app-sub">Intelligent library shuffle</div>
+      </div>
+    </header>
+
+    <div id="status-card">
+      <div id="now-playing-label">Now playing</div>
+      <div id="now-playing-title">—</div>
+      <div id="queue-info">Queue: — / —&nbsp;&nbsp;·&nbsp;&nbsp;Cycle: —</div>
+    </div>
+
+    <div id="actions">
+      <button id="btn-start" class="btn btn-primary">
+        <span class="btn-icon">▶</span> Start Shuffle
+      </button>
+      <button id="btn-resume" class="btn btn-secondary" disabled>
+        <span class="btn-icon">↺</span> Resume
+      </button>
+      <button id="btn-reshuffle" class="btn btn-secondary" disabled>
+        <span class="btn-icon">⇌</span> Re-shuffle
+      </button>
+    </div>
+
+    <div id="footer-actions">
+      <button id="btn-clear" class="btn btn-danger-ghost">Clear queue &amp; history</button>
+    </div>
+
+    <div id="message"></div>
+
+    <footer>
+      <span id="footer-note">Go to suno.com/me → Liked tab, then Start Shuffle</span>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

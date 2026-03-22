@@ -47,8 +47,10 @@ function updateStatusUI(status) {
   }
 }
 
-// Get the active suno.com tab
+// Get the active suno.com tab, preferring the focused/active one
 async function getSunoTab() {
+  const active = await chrome.tabs.query({ active: true, url: 'https://suno.com/*' });
+  if (active.length > 0) return active[0];
   const tabs = await chrome.tabs.query({ url: 'https://suno.com/*' });
   return tabs.length > 0 ? tabs[0] : null;
 }

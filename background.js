@@ -34,10 +34,10 @@ function constrainedShuffle(songs) {
 
       collisionFound = true;
       let swapped = false;
+      const afterINorm = i + 1 < arr.length ? normalizeTitle(arr[i + 1].title) : null;
 
       for (let j = i + 1; j < arr.length; j++) {
         const jNorm      = normalizeTitle(arr[j].title);
-        const afterINorm = i + 1 < arr.length ? normalizeTitle(arr[i + 1].title) : null;
         const beforeJNorm = normalizeTitle(arr[j - 1].title);
         const afterJNorm  = j + 1 < arr.length ? normalizeTitle(arr[j + 1].title) : null;
 
@@ -56,7 +56,8 @@ function constrainedShuffle(songs) {
           const jNorm       = normalizeTitle(arr[j].title);
           const afterJNorm  = normalizeTitle(arr[j + 1].title);
           const beforeJNorm = j > 0 ? normalizeTitle(arr[j - 1].title) : null;
-          if (jNorm !== prevNorm && currNorm !== (beforeJNorm || '') && currNorm !== afterJNorm) {
+          if (jNorm !== prevNorm && (afterINorm === null || jNorm !== afterINorm) &&
+              currNorm !== (beforeJNorm || '') && currNorm !== afterJNorm) {
             [arr[i], arr[j]] = [arr[j], arr[i]];
             break;
           }
@@ -96,6 +97,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
       await chrome.storage.local.set({
         queue,
+        songsPool: allSongs,
         queueIndex: 0,
         totalSongs: allSongs.length,
         lastUpdated: Date.now(),
@@ -109,8 +111,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // ── RESHUFFLE_STORED — reshuffle the same song list for a new cycle ────────
   if (message.type === 'RESHUFFLE_STORED') {
     (async () => {
-      const stored = await chrome.storage.local.get(['queue', 'queueCycle']);
-      const allSongs = stored.queue || [];
+      const stored = await chrome.storage.local.get(['songsPool', 'queueCycle']);
+      const allSongs = stored.songsPool || [];
 
       if (allSongs.length === 0) {
         sendResponse({ done: true });
@@ -173,7 +175,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // ── CLEAR_QUEUE ───────────────────────────────────────────────────────────
   if (message.type === 'CLEAR_QUEUE') {
     chrome.storage.local.remove(
-      ['queue', 'queueIndex', 'playedIds', 'currentSong', 'totalSongs', 'queueCycle', 'lastUpdated'],
+      ['queue', 'songsPool', 'queueIndex', 'playedIds', 'currentSong', 'totalSongs', 'queueCycle', 'lastUpdated'],
       () => sendResponse({ success: true })
     );
     return true;
@@ -192,7 +194,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       let playedIds = stored.playedIds || [];
       playedIds = playedIds.slice(0, Math.max(0, playedIds.length - 2));
 
-      await chrome.storage.local.set({ queueIndex: targetIndex, playedIds, currentSong: song });
+      await chrome.storage.local.set({ queueIndex: targetIndex + 1, playedIds, currentSong: song });
       sendResponse({ song, index: targetIndex, total: queue.length });
     })();
     return true;

@@ -6,6 +6,12 @@
   if (window.__sunoShuffleLoaded) return;
   window.__sunoShuffleLoaded = true;
 
+  // Reset the guard if the extension reloads so the new content script can init.
+  try {
+    const _keepalive = chrome.runtime.connect({ name: 'ss-keepalive' });
+    _keepalive.onDisconnect.addListener(() => { window.__sunoShuffleLoaded = false; });
+  } catch (e) { /* extension context already gone */ }
+
   // ─── Guard: exit cleanly if extension was reloaded ─────────────────────────
   function chromeSafe(fn) {
     try {
@@ -134,7 +140,7 @@
     const songs = new Map();
     let lastSize = -1;
     let staleRounds = 0;
-    const MAX_STALE = 6;        // 6 × 1200ms = 7.2s of no new songs before stopping
+    const MAX_STALE = 6;        // 6 × 2000ms = 12s of no new songs before stopping
     const STEP = 600;           // scroll 600px per tick — small enough to trigger observers
 
     setOverlayStatus('Scanning… (0 songs)');
@@ -171,7 +177,7 @@
       }
 
       scrollDown();
-      await sleep(1200);
+      await sleep(2000);
     }
 
     scrollToTop();
@@ -377,13 +383,15 @@
   }
 
   function advanceQueue() {
+    if (!shuffleActive) return;
     chromeSafe(() => {
       chrome.runtime.sendMessage({ type: 'GET_NEXT_SONG' }, (response) => {
-        if (chrome.runtime.lastError || !response) return;
+        if (!shuffleActive || chrome.runtime.lastError || !response) return;
         if (response.done) {
           // Queue exhausted — reshuffle the same song list for a new cycle
           setOverlayStatus('Reshuffling…');
           chrome.runtime.sendMessage({ type: 'RESHUFFLE_STORED' }, (res) => {
+            if (!shuffleActive) return;
             if (res?.song) {
               playSong(res.song, res.index, res.total);
             } else {
@@ -409,17 +417,27 @@
     }
   }
 
+  let navLocked = false;
+  function navLock(fn) {
+    if (navLocked) return;
+    navLocked = true;
+    fn();
+    setTimeout(() => { navLocked = false; }, 600);
+  }
+
   function skipSong() {
     if (!shuffleActive) return;
-    audio.pause(); stopProgressTracking(); advanceQueue();
+    navLock(() => { audio.pause(); stopProgressTracking(); advanceQueue(); });
   }
 
   function prevSong() {
     if (!shuffleActive) return;
-    audio.pause(); stopProgressTracking();
-    chromeSafe(() => {
-      chrome.runtime.sendMessage({ type: 'STEP_BACK' }, (resp) => {
-        if (resp?.song) playSong(resp.song, resp.index, resp.total);
+    navLock(() => {
+      audio.pause(); stopProgressTracking();
+      chromeSafe(() => {
+        chrome.runtime.sendMessage({ type: 'STEP_BACK' }, (resp) => {
+          if (resp?.song) playSong(resp.song, resp.index, resp.total);
+        });
       });
     });
   }

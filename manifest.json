@@ -3,12 +3,10 @@
   "name": "Suno Shuffle",
   "version": "1.0.0",
   "description": "Intelligently shuffle your Suno library with a persistent queue across sessions.",
-  "permissions": ["storage", "cookies", "tabs", "scripting"],
+  "permissions": ["storage", "tabs", "scripting"],
   "host_permissions": [
     "https://suno.com/*",
-    "https://studio-api.suno.ai/*",
-    "https://cdn1.suno.ai/*",
-    "https://clerk.suno.com/*"
+    "https://cdn1.suno.ai/*"
   ],
   "background": {
     "service_worker": "background.js"

@@ -1,10 +1,11 @@
 // popup.js
 
-const btnStart     = document.getElementById('btn-start');
-const btnResume    = document.getElementById('btn-resume');
-const btnReshuffle = document.getElementById('btn-reshuffle');
-const btnResetPos  = document.getElementById('btn-reset-pos');
-const btnClear     = document.getElementById('btn-clear');
+const btnStart      = document.getElementById('btn-start');
+const btnResume     = document.getElementById('btn-resume');
+const btnReshuffle  = document.getElementById('btn-reshuffle');
+const btnCancelScan = document.getElementById('btn-cancel-scan');
+const btnResetPos   = document.getElementById('btn-reset-pos');
+const btnClear      = document.getElementById('btn-clear');
 const msgEl        = document.getElementById('message');
 const nowTitle     = document.getElementById('now-playing-title');
 const queueInfo    = document.getElementById('queue-info');
@@ -24,6 +25,13 @@ function setLoading(on) {
   btnResume.disabled    = on;
   btnReshuffle.disabled = on;
   btnClear.disabled     = on;
+}
+
+function setScanningMode(on, tab) {
+  btnCancelScan.style.display = on ? 'block' : 'none';
+  if (on) {
+    btnCancelScan.onclick = () => sendToContent(tab, { type: 'CANCEL_SCAN' });
+  }
 }
 
 function updateStatusUI(status) {
@@ -92,7 +100,9 @@ btnStart.addEventListener('click', async () => {
     // Small delay to ensure content script is ready after potential navigation
     await new Promise(r => setTimeout(r, 500));
 
+    setScanningMode(true, tab);
     const res = await sendToContent(tab, { type: 'START_SHUFFLE' });
+    setScanningMode(false, null);
 
     if (!res || !res.success) {
       showMsg(res?.error || 'Failed to start shuffle. Try reloading suno.com.', 'error');

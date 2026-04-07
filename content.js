@@ -31,6 +31,7 @@
   let currentSong   = null;
   let progressInterval = null;
   let overlayMinimized = false;
+  let scanCancelled = false;
 
   // ─── DOM References (overlay) ──────────────────────────────────────────────
   let overlay, titleEl, counterEl, imgEl, progressFill, timeEl, playPauseBtn, spinnerEl;
@@ -137,6 +138,7 @@
    * songs, accumulating them into a Map even as virtual scroll removes earlier nodes.
    */
   async function loadAllSongsFromCurrentPage() {
+    scanCancelled = false;
     const songs = new Map();
     let lastSize = -1;
     let staleRounds = 0;
@@ -144,6 +146,7 @@
     const STEP = 600;           // scroll 600px per tick — small enough to trigger observers
 
     setOverlayStatus('Scanning… (0 songs)');
+    setScanningUI(true);
 
     // Find scroll container once (it may not exist yet, retry briefly)
     let container = null;
@@ -153,10 +156,7 @@
     }
 
     function scrollDown() {
-      if (container) {
-        container.scrollTop += STEP;
-      }
-      // Always also scroll the window — some pages use both
+      if (container) container.scrollTop += STEP;
       window.scrollBy({ top: STEP, behavior: 'instant' });
     }
 
@@ -165,7 +165,7 @@
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
-    while (staleRounds < MAX_STALE) {
+    while (staleRounds < MAX_STALE && !scanCancelled) {
       scrapeVisibleSongs(songs);
 
       if (songs.size > lastSize) {
@@ -180,6 +180,7 @@
       await sleep(2000);
     }
 
+    setScanningUI(false);
     scrollToTop();
     return Array.from(songs.values());
   }
@@ -227,6 +228,7 @@
       '    <button id="ss-skip"       title="Skip">\u23ed</button>',
       '    <button id="ss-stop"       title="Stop shuffle">\u25a0</button>',
       '  </div>',
+      '  <button id="ss-cancel-scan">Stop scanning, play found songs</button>',
       '</div>',
     ].join('\n');
 
@@ -264,6 +266,7 @@
     overlay.querySelector('#ss-stop').addEventListener('click', stopCurrentSong);
     overlay.querySelector('#ss-prev').addEventListener('click', prevSong);
     overlay.querySelector('#ss-progress-bar').addEventListener('click', seekTo);
+    overlay.querySelector('#ss-cancel-scan').addEventListener('click', () => { scanCancelled = true; });
 
     makeDraggable(overlay, overlay.querySelector('#ss-header'));
   }
@@ -300,6 +303,14 @@
     overlay.classList.toggle('ss-minimized', overlayMinimized);
     overlay.querySelector('#ss-minimize').textContent = overlayMinimized ? '+' : '\u2212';
     chromeSafe(() => chrome.storage.local.set({ overlayMinimized }));
+  }
+
+  function setScanningUI(scanning) {
+    if (!overlay) return;
+    const controls   = overlay.querySelector('#ss-controls');
+    const cancelBtn  = overlay.querySelector('#ss-cancel-scan');
+    if (controls)  controls.style.display  = scanning ? 'none' : 'flex';
+    if (cancelBtn) cancelBtn.style.display = scanning ? 'block' : 'none';
   }
 
   function setSpinner(on) {
@@ -579,6 +590,11 @@
     if (message.type === 'CONTENT_STOP') {
       stopShuffle();
       if (overlay) overlay.style.display = 'none';
+      sendResponse({ success: true });
+    }
+
+    if (message.type === 'CANCEL_SCAN') {
+      scanCancelled = true;
       sendResponse({ success: true });
     }
 

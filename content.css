@@ -191,6 +191,24 @@
   background: #4a2a2a !important;
 }
 
+/* ── Cancel scan button ──────────────────────────────────── */
+#ss-cancel-scan {
+  display: none;
+  width: 100%;
+  background: #2a2a4a;
+  border: 1px solid #3a3a6a;
+  color: #e05555;
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+#ss-cancel-scan:hover {
+  background: #4a2a2a;
+}
+
 /* ── Minimized state ─────────────────────────────────────── */
 #ss-overlay.ss-minimized #ss-body {
   display: none;

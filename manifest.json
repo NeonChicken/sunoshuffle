@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Suno Shuffle",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Intelligently shuffle your Suno library with a persistent queue across sessions.",
   "permissions": ["storage", "tabs"],
   "host_permissions": [

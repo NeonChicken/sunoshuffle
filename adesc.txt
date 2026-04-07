@@ -1,7 +1,0 @@
-Suno Shuffle fixes Suno's built-in shuffle function, which repeats the same songs, skips others entirely, and resets every time you reload.
-
-This extension builds a proper randomised queue from your library and remembers where you left off across page navigations and reloads. Every song plays exactly once before the queue cycles.
-
-Suno often gives uploaded songs the same title. This extension tries to not play songs of the same title in a row, this is integrated into the shuffle function.
-
-To use it, open your Suno library tab (e.g. suno.com/me or suno.com/playlist/liked), then click Start Shuffle in the extension popup. It scans the page, builds the queue, and starts playing immediately via a small floating player.

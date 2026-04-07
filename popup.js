@@ -3,6 +3,7 @@
 const btnStart     = document.getElementById('btn-start');
 const btnResume    = document.getElementById('btn-resume');
 const btnReshuffle = document.getElementById('btn-reshuffle');
+const btnResetPos  = document.getElementById('btn-reset-pos');
 const btnClear     = document.getElementById('btn-clear');
 const msgEl        = document.getElementById('message');
 const nowTitle     = document.getElementById('now-playing-title');
@@ -156,6 +157,21 @@ btnReshuffle.addEventListener('click', async () => {
     showMsg('Error: ' + e.message, 'error');
   } finally {
     setLoading(false);
+  }
+});
+
+// ── Reset Player Position ─────────────────────────────────────────────────────
+btnResetPos.addEventListener('click', async () => {
+  clearMsg();
+  try {
+    await chrome.storage.local.remove('overlayPos');
+    const tab = await getSunoTab();
+    if (tab) {
+      await sendToContent(tab, { type: 'RESET_OVERLAY_POS' });
+    }
+    showMsg('Player position reset.', 'success');
+  } catch (e) {
+    showMsg('Error: ' + e.message, 'error');
   }
 });
 

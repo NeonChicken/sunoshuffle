@@ -261,7 +261,7 @@
     overlay.querySelector('#ss-minimize').addEventListener('click', toggleMinimize);
     overlay.querySelector('#ss-play-pause').addEventListener('click', togglePlayPause);
     overlay.querySelector('#ss-skip').addEventListener('click', skipSong);
-    overlay.querySelector('#ss-stop').addEventListener('click', stopShuffle);
+    overlay.querySelector('#ss-stop').addEventListener('click', stopCurrentSong);
     overlay.querySelector('#ss-prev').addEventListener('click', prevSong);
     overlay.querySelector('#ss-progress-bar').addEventListener('click', seekTo);
 
@@ -362,6 +362,8 @@
   }
 
   function playSong(song, index, total) {
+    navigating = false;
+    const gen = ++playGen;   // every new song gets a unique generation
     currentSong = song;
     setSpinner(true);
     setCurrentSongUI(song, index, total);
@@ -369,13 +371,22 @@
     audio.src = song.audio_url;
     audio.load();
     audio.play()
-      .then(() => { setSpinner(false); startProgressTracking(); pauseSunoNativePlayer(); })
+      .then(() => {
+        if (gen !== playGen) return;   // a newer song already took over
+        setSpinner(false); startProgressTracking(); pauseSunoNativePlayer();
+      })
       .catch(() => {
+        if (gen !== playGen) return;   // skip aborted this play() — not a real failure
         setSpinner(false);
         const alt = song.audio_url.replace('cdn1.suno.ai', 'cdn2.suno.ai');
         if (audio.src !== alt) {
           audio.src = alt;
-          audio.play().catch(() => { console.warn('[SunoShuffle] Skipping unplayable song'); advanceQueue(); });
+          audio.play()
+            .then(() => { if (gen === playGen) { startProgressTracking(); pauseSunoNativePlayer(); } })
+            .catch(() => {
+              if (gen !== playGen) return;
+              console.warn('[SunoShuffle] Skipping unplayable song'); advanceQueue();
+            });
         } else {
           advanceQueue();
         }
@@ -395,6 +406,7 @@
             if (res?.song) {
               playSong(res.song, res.index, res.total);
             } else {
+              navigating = false;
               setOverlayStatus('All songs played. Press Start Shuffle to scan again.');
               shuffleActive = false;
             }
@@ -417,33 +429,54 @@
     }
   }
 
-  let navLocked = false;
-  function navLock(fn) {
-    if (navLocked) return;
-    navLocked = true;
-    fn();
-    setTimeout(() => { navLocked = false; }, 600);
-  }
+  // navigating + playGen together prevent concurrent queue advances.
+  // navigating blocks new skip/prev clicks while one is in-flight.
+  // playGen is incremented on every skip/prev/playSong so that stale
+  // .catch() / error callbacks from interrupted plays are silently ignored.
+  let navigating = false;
+  let playGen    = 0;
 
   function skipSong() {
-    if (!shuffleActive) return;
-    navLock(() => { audio.pause(); stopProgressTracking(); advanceQueue(); });
+    if (!shuffleActive || navigating) return;
+    navigating = true;
+    playGen++;              // invalidate any pending .catch() from the paused song
+    audio.pause();
+    stopProgressTracking();
+    advanceQueue();
   }
 
   function prevSong() {
-    if (!shuffleActive) return;
-    navLock(() => {
-      audio.pause(); stopProgressTracking();
-      chromeSafe(() => {
-        chrome.runtime.sendMessage({ type: 'STEP_BACK' }, (resp) => {
-          if (resp?.song) playSong(resp.song, resp.index, resp.total);
-        });
+    if (!shuffleActive || navigating) return;
+    navigating = true;
+    playGen++;
+    audio.pause();
+    stopProgressTracking();
+    chromeSafe(() => {
+      chrome.runtime.sendMessage({ type: 'STEP_BACK' }, (resp) => {
+        if (resp?.song) {
+          playSong(resp.song, resp.index, resp.total);
+        } else {
+          navigating = false;
+        }
       });
     });
   }
 
+  // Stop = pause the current song and rewind to the beginning.
+  // The queue stays intact; pressing play resumes from the start of the song.
+  function stopCurrentSong() {
+    if (!overlay) return;
+    audio.pause();
+    audio.currentTime = 0;
+    stopProgressTracking();
+    if (progressFill) progressFill.style.width = '0%';
+    if (timeEl)       timeEl.textContent = '0:00';
+    if (playPauseBtn) playPauseBtn.textContent = '\u25b6';
+  }
+
   function stopShuffle() {
     shuffleActive = false;
+    navigating = false;
     audio.pause(); audio.src = '';
     stopProgressTracking();
     currentSong = null;
@@ -501,13 +534,18 @@
 
   // ─── Audio events ──────────────────────────────────────────────────────────
 
-  audio.addEventListener('ended',  () => { if (shuffleActive) advanceQueue(); });
+  audio.addEventListener('ended',  () => { if (shuffleActive && !navigating) advanceQueue(); });
   audio.addEventListener('pause',  () => { if (playPauseBtn) playPauseBtn.textContent = '\u25b6'; });
   audio.addEventListener('play',   () => { if (playPauseBtn) playPauseBtn.textContent = '\u23f8'; });
   audio.addEventListener('error',  () => {
     if (!shuffleActive) return;
+    const gen = playGen;
     console.warn('[SunoShuffle] Audio error, skipping in 1s\u2026');
-    setTimeout(advanceQueue, 1000);
+    setTimeout(() => {
+      // Ignore if a newer song already started (gen changed) or a skip is in-flight
+      if (gen !== playGen || !shuffleActive || navigating) return;
+      advanceQueue();
+    }, 1000);
   });
 
   // ─── Message listeners ─────────────────────────────────────────────────────
@@ -541,6 +579,16 @@
     if (message.type === 'CONTENT_STOP') {
       stopShuffle();
       if (overlay) overlay.style.display = 'none';
+      sendResponse({ success: true });
+    }
+
+    if (message.type === 'RESET_OVERLAY_POS') {
+      if (overlay) {
+        overlay.style.left   = '';
+        overlay.style.top    = '';
+        overlay.style.right  = '24px';
+        overlay.style.bottom = '24px';
+      }
       sendResponse({ success: true });
     }
 

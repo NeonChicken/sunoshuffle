@@ -132,6 +132,14 @@ header {
   color: #fff;
 }
 
+/* ── Reset hint ──────────────── */
+#reset-hint {
+  font-size: 10px;
+  color: #404070;
+  text-align: center;
+  margin-top: -2px;
+}
+
 /* ── Footer actions ──────────── */
 #footer-actions {
   display: flex;

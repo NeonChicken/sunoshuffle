@@ -32,6 +32,8 @@
   let progressInterval = null;
   let overlayMinimized = false;
   let scanCancelled = false;
+  let volumeSlider  = null;
+  let pendingResume = false;
 
   // ─── DOM References (overlay) ──────────────────────────────────────────────
   let overlay, titleEl, counterEl, imgEl, progressFill, timeEl, playPauseBtn, spinnerEl;
@@ -198,6 +200,7 @@
       timeEl       = document.getElementById('ss-time');
       playPauseBtn = document.getElementById('ss-play-pause');
       spinnerEl    = document.getElementById('ss-spinner');
+      volumeSlider = document.getElementById('ss-volume-slider');
       return;
     }
 
@@ -228,6 +231,10 @@
       '    <button id="ss-skip"       title="Skip">\u23ed</button>',
       '    <button id="ss-stop"       title="Stop shuffle">\u25a0</button>',
       '  </div>',
+      '  <div id="ss-volume-row">',
+      '    <span id="ss-vol-icon">&#x1F50A;</span>',
+      '    <input id="ss-volume-slider" type="range" min="0" max="100" value="100" />',
+      '  </div>',
       '  <button id="ss-cancel-scan">Stop scanning, play found songs</button>',
       '</div>',
     ].join('\n');
@@ -241,10 +248,11 @@
     timeEl       = overlay.querySelector('#ss-time');
     playPauseBtn = overlay.querySelector('#ss-play-pause');
     spinnerEl    = overlay.querySelector('#ss-spinner');
+    volumeSlider = overlay.querySelector('#ss-volume-slider');
 
     // Restore position / minimized state
     chromeSafe(() => {
-      chrome.storage.local.get(['overlayPos', 'overlayMinimized'], (data) => {
+      chrome.storage.local.get(['overlayPos', 'overlayMinimized', 'overlayVolume'], (data) => {
         if (!data) return;
         if (data.overlayPos) {
           overlay.style.left   = data.overlayPos.x + 'px';
@@ -257,6 +265,10 @@
           overlay.classList.add('ss-minimized');
           overlay.querySelector('#ss-minimize').textContent = '+';
         }
+        if (data.overlayVolume != null) {
+          audio.volume = data.overlayVolume;
+          if (volumeSlider) volumeSlider.value = Math.round(data.overlayVolume * 100);
+        }
       });
     });
 
@@ -267,6 +279,11 @@
     overlay.querySelector('#ss-prev').addEventListener('click', prevSong);
     overlay.querySelector('#ss-progress-bar').addEventListener('click', seekTo);
     overlay.querySelector('#ss-cancel-scan').addEventListener('click', () => { scanCancelled = true; });
+    overlay.querySelector('#ss-volume-slider').addEventListener('input', (e) => {
+      const v = e.target.value / 100;
+      audio.volume = v;
+      chromeSafe(() => chrome.storage.local.set({ overlayVolume: v }));
+    });
 
     makeDraggable(overlay, overlay.querySelector('#ss-header'));
   }
@@ -432,7 +449,19 @@
   // ─── Controls ──────────────────────────────────────────────────────────────
 
   function togglePlayPause() {
-    if (!shuffleActive) return;
+    if (!shuffleActive) {
+      if (!pendingResume) return;
+      pendingResume = false;
+      chromeSafe(() => {
+        chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (status) => {
+          if (status?.currentSong) {
+            shuffleActive = true;
+            playSong(status.currentSong, Math.max(0, status.queueIndex - 1), status.queueLength);
+          }
+        });
+      });
+      return;
+    }
     if (audio.paused) {
       audio.play(); if (playPauseBtn) playPauseBtn.textContent = '\u23f8'; startProgressTracking();
     } else {
@@ -620,8 +649,10 @@
       if (!data) return;
       if (data.currentSong || (data.queue && data.queue.length > 0)) {
         createOverlay();
-        if (data.currentSong && titleEl) {
-          titleEl.textContent = data.currentSong.title + ' (paused)';
+        if (data.currentSong) {
+          pendingResume = true;
+          if (playPauseBtn) playPauseBtn.textContent = '\u25b6';
+          if (titleEl) { titleEl.textContent = data.currentSong.title + ' (paused)'; }
           if (data.queue && counterEl) counterEl.textContent = `\u2014 / ${data.queue.length}`;
           if (data.currentSong.image_url && imgEl) {
             imgEl.src = data.currentSong.image_url;

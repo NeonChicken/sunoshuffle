@@ -191,6 +191,58 @@
   background: #4a2a2a !important;
 }
 
+/* ── Volume ───────────────────────────────────────────────── */
+#ss-volume-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#ss-vol-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+#ss-volume-slider {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: #2e2e50;
+  outline: none;
+  cursor: pointer;
+}
+
+#ss-volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #a07af5;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+#ss-volume-slider::-webkit-slider-thumb:hover {
+  background: #c0a0ff;
+}
+
+#ss-volume-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #a07af5;
+  cursor: pointer;
+  border: none;
+  transition: background 0.15s;
+}
+
+#ss-volume-slider::-moz-range-thumb:hover {
+  background: #c0a0ff;
+}
+
 /* ── Cancel scan button ──────────────────────────────────── */
 #ss-cancel-scan {
   display: none;

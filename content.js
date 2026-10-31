@@ -73,18 +73,24 @@
     // Strategy 2: anchor links pointing to /song/{uuid}.
     // Current Suno markup: <a href="/song/{id}">Title</a> inside an unattributed row div.
     // (Thumbnail UUIDs are NOT clip ids anymore, so images are never used to discover songs.)
+    // Only links inside a list row (one with a "Play <title>" cover) count, so the
+    // miniplayer / now-playing panel's link to whatever is playing doesn't sneak in.
+    // If Suno ever drops that row button, fall back to accepting every song link.
+    const anyRows = !!document.querySelector('[role="button"][aria-label^="Play "]');
     document.querySelectorAll('a[href*="/song/"]').forEach(a => {
       if (a.closest('#ss-overlay')) return;
       const m = (a.getAttribute('href') || '').match(SONG_HREF_RE);
       if (!m) return;
       const id = m[1].toLowerCase();
 
+      const container = findSongRow(a, id);
+      if (anyRows && !container.querySelector('[role="button"][aria-label^="Play "]')) return;
+
       const linkText = a.textContent.trim();
       const hasLinkTitle = linkText.length >= 1 && linkText.length <= 150 && !isDurationString(linkText);
       const existing = accumulator.get(id);
       if (existing && (strongTitleIds.has(id) || !hasLinkTitle)) return;
 
-      const container = findSongRow(a, id);
       const title = hasLinkTitle ? linkText : (extractTitle(container) || `Song ${id.slice(0, 8)}`);
       if (hasLinkTitle) strongTitleIds.add(id);
       accumulator.set(id, { id, title, image_url: existing?.image_url || extractImage(container, id) });
@@ -150,6 +156,17 @@
     return img.src.replace(/([?&]width=)\d+/, '$1360');
   }
 
+  /** Song count the page announces for its list (e.g. <ul aria-label="18 songs">), or null. */
+  function expectedSongCount() {
+    const counts = [];
+    for (const el of document.querySelectorAll('ul[aria-label], ol[aria-label]')) {
+      const m = (el.getAttribute('aria-label') || '').match(/^(\d[\d,.]*)\s+songs?$/i);
+      if (m) counts.push(parseInt(m[1].replace(/[,.]/g, ''), 10));
+    }
+    // Only trust it when there's exactly one such list — otherwise keep scrolling.
+    return counts.length === 1 && counts[0] > 0 ? counts[0] : null;
+  }
+
   /**
    * Find the element that actually scrolls the song list.
    * Suno renders the list inside a scrollable div, not the window.
@@ -180,7 +197,9 @@
     const songs = new Map();
     let lastSize = -1;
     let staleRounds = 0;
-    const MAX_STALE = 6;        // 6 × 2000ms = 12s of no new songs before stopping
+    const TICK = 800;           // ms between scroll steps
+    const MAX_STALE = 12;       // ~10s without new songs while still able to scroll
+    const MAX_STALE_BOTTOM = 4; // ~3s at the very bottom (time for lazy loading to kick in)
     const STEP = 600;           // scroll 600px per tick — small enough to trigger observers
 
     setOverlayStatus('Scanning… (0 songs)');
@@ -193,17 +212,20 @@
       if (!container) await sleep(600);
     }
 
+    /** Scroll one step; returns false when nothing could scroll any further. */
     function scrollDown() {
+      const before = (container ? container.scrollTop : 0) + window.scrollY;
       if (container) container.scrollTop += STEP;
       window.scrollBy({ top: STEP, behavior: 'instant' });
+      return (container ? container.scrollTop : 0) + window.scrollY !== before;
     }
 
     function scrollToTop() {
       if (container) container.scrollTop = 0;
-      window.scrollTo({ top: 0, behavior: 'smooth' });
+      window.scrollTo({ top: 0, behavior: 'instant' });
     }
 
-    while (staleRounds < MAX_STALE && !scanCancelled) {
+    while (!scanCancelled) {
       scrapeVisibleSongs(songs);
 
       if (songs.size > lastSize) {
@@ -214,8 +236,13 @@
         staleRounds++;
       }
 
-      scrollDown();
-      await sleep(2000);
+      // Playlists label their list "<N> songs" — stop as soon as we have them all.
+      const expected = expectedSongCount();
+      if (expected && songs.size >= expected) break;
+
+      const moved = scrollDown();
+      if (staleRounds >= (moved ? MAX_STALE : MAX_STALE_BOTTOM)) break;
+      await sleep(TICK);
     }
 
     setScanningUI(false);
@@ -666,7 +693,14 @@
     if (!shuffleActive) return;
     chromeSafe(() => {
       chrome.runtime.sendMessage({ type: 'GET_NEXT_SONG' }, (response) => {
-        if (!shuffleActive || chrome.runtime.lastError || !response) return;
+        if (!shuffleActive) return;
+        if (chrome.runtime.lastError || !response) {
+          // Don't leave skip/prev locked forever if the background didn't answer.
+          navigating = false;
+          setSpinner(false);
+          setOverlayStatus('Could not get the next song — press ⏭ to retry');
+          return;
+        }
         if (response.done) {
           // Queue exhausted — reshuffle the same song list for a new cycle
           setOverlayStatus('Reshuffling…');
@@ -745,6 +779,7 @@
     stopProgressTracking();
     chromeSafe(() => {
       chrome.runtime.sendMessage({ type: 'STEP_BACK' }, (resp) => {
+        if (chrome.runtime.lastError) { navigating = false; return; }
         if (resp?.song) {
           playSong(resp.song, resp.index, resp.total);
         } else {

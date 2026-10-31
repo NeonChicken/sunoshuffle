@@ -97,6 +97,12 @@ function constrainedShuffle(songs) {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
+  // ── WHOAMI — content scripts don't know their own tab id ─────────────────
+  if (message.type === 'WHOAMI') {
+    sendResponse({ tabId: _sender.tab ? _sender.tab.id : null });
+    return;
+  }
+
   // ── IS_DEV — content script can't call chrome.management itself ──────────
   if (message.type === 'IS_DEV') {
     isDevBuild().then(dev => sendResponse({ dev }));

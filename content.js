@@ -94,6 +94,30 @@
     shuffleActive = on;
     applyBarVisibility();
     window.postMessage({ __ssBridge: 'state', active: on }, location.origin);
+    setHeartbeat(on);
+  }
+
+  // While this tab is shuffling it leaves a heartbeat, so other Suno tabs (e.g. a song
+  // opened in a new tab) don't pop up a second, paused overlay.
+  const HEARTBEAT_KEY = 'ssPlayingTab';
+  const HEARTBEAT_MS = 5000;
+  let heartbeatTimer = null;
+  let myTabId = null;
+  const myTabIdReady = sendMessage({ type: 'WHOAMI' }).then(r => { myTabId = r?.tabId ?? null; });
+
+  function setHeartbeat(on) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+    if (on) {
+      const beat = () => myTabIdReady.then(() =>
+        storageSet({ [HEARTBEAT_KEY]: { tabId: myTabId, at: Date.now() } }));
+      beat();
+      heartbeatTimer = setInterval(beat, HEARTBEAT_MS);
+    } else {
+      chromeSafe(() => chrome.storage.local.get(HEARTBEAT_KEY, (d) => {
+        if (d && d[HEARTBEAT_KEY] && d[HEARTBEAT_KEY].tabId === myTabId) chrome.storage.local.remove(HEARTBEAT_KEY);
+      }));
+    }
   }
 
   function applyBarVisibility() {
@@ -385,9 +409,9 @@
 
         <div id="ss-player">
           <div id="ss-now">
-            <div id="ss-art-wrap"><img id="ss-img" alt="" /><div id="ss-spinner"></div></div>
+            <a id="ss-art-wrap" class="ss-song-link" draggable="false"><img id="ss-img" alt="" draggable="false" /><div id="ss-spinner"></div></a>
             <div id="ss-meta">
-              <div id="ss-song-title">Not playing</div>
+              <a id="ss-song-title" class="ss-song-link" draggable="false">Not playing</a>
               <div id="ss-sub"></div>
             </div>
           </div>
@@ -445,6 +469,7 @@
         setVolume(v, false);
         chromeSafe(() => chrome.storage.local.set({ overlayVolume: v }));
       });
+      root.querySelectorAll('.ss-song-link').forEach(a => a.addEventListener('click', onSongLinkClick));
       setupSeek($('#ss-progress-bar'));
       makeDraggable(root, $('#ss-header'));
 
@@ -544,7 +569,9 @@
       ensure();
       showPlayer();
       const t = $('#ss-song-title');
-      t.textContent = song.title; t.title = song.title;
+      t.textContent = song.title;
+      t.title = `Open “${song.title}” (Ctrl+click: new tab)`;
+      root.querySelectorAll('.ss-song-link').forEach(a => { a.href = `/song/${song.id}`; });
       $('#ss-sub').textContent = total ? `${index + 1} of ${total}` : '';
       const img = $('#ss-img');
       if (song.image_url) {
@@ -562,6 +589,7 @@
       showPlayer();
       $('#ss-song-title').textContent = title;
       $('#ss-song-title').title = '';
+      root.querySelectorAll('.ss-song-link').forEach(a => a.removeAttribute('href'));
       $('#ss-sub').textContent = sub || '';
       $('#ss-img').removeAttribute('src');
       $('#ss-img').style.visibility = 'hidden';
@@ -675,6 +703,22 @@
       resetPosition, placeAt, get root() { return root; },
     };
   })();
+
+  /**
+   * Title / cover click: open the song's page. A plain click navigates client-side, so the
+   * music keeps playing (the next song switches back to the list by itself); Ctrl/Cmd/Shift
+   * or middle click fall through to the browser and open a new tab as usual.
+   */
+  async function onSongLinkClick(e) {
+    const a = e.currentTarget;
+    const href = a.getAttribute('href');
+    if (!href) { e.preventDefault(); return; }
+    if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+    e.preventDefault();
+    if (location.pathname === href) return;
+    const ok = await routerNavigate(href);
+    if (!ok) window.open(href, '_blank', 'noopener');
+  }
 
   function makeDraggable(el, handle) {
     handle.addEventListener('pointerdown', (e) => {
@@ -1266,15 +1310,18 @@
   // ─── Restore on page load ──────────────────────────────────────────────────
 
   chromeSafe(() => {
-    chrome.storage.local.get(['queue', 'currentSong', 'queueIndex', 'sourcePath', 'sourceName', 'overlayClosed', AUTOPLAY_KEY], (data) => {
+    chrome.storage.local.get(['queue', 'currentSong', 'queueIndex', 'sourcePath', 'sourceName', 'overlayClosed', AUTOPLAY_KEY, HEARTBEAT_KEY], async (data) => {
       if (!data) return;
+      await myTabIdReady;
+      const hb = data[HEARTBEAT_KEY];
+      const otherTabPlaying = hb && hb.tabId !== myTabId && Date.now() - hb.at < HEARTBEAT_MS * 2.5;
       if (data.sourcePath && !sourcePath) sourcePath = data.sourcePath;
       if (data.sourceName && !sourceName) sourceName = data.sourceName;
       const total = (data.queue || []).length;
       const index = Math.max(0, (data.queueIndex || 1) - 1);
 
       // A song switch turned into a full page reload: keep the shuffle going.
-      const ap = data[AUTOPLAY_KEY];
+      const ap = otherTabPlaying ? null : data[AUTOPLAY_KEY];
       if (ap) chrome.storage.local.remove(AUTOPLAY_KEY);
       if (ap && data.currentSong && ap.id === data.currentSong.id && Date.now() - ap.at < AUTOPLAY_TTL) {
         log('page reloaded mid-switch — resuming', ap.id);
@@ -1286,7 +1333,7 @@
         return;
       }
 
-      if (data.currentSong && !data.overlayClosed) {
+      if (data.currentSong && !data.overlayClosed && !otherTabPlaying) {
         pendingResume = true;
         ui.ensure();
         ui.setSource(sourceName);

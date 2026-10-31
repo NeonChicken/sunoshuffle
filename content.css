@@ -199,6 +199,21 @@ html.ss-hide-playbar [data-playbar="true"] {
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
 }
 
+#ss-overlay a.ss-song-link {
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+#ss-overlay a#ss-song-title[href]:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+#ss-overlay a#ss-art-wrap { display: block; }
+#ss-overlay a#ss-art-wrap[href]:hover #ss-img { opacity: 0.85; }
+#ss-overlay a.ss-song-link:not([href]) { cursor: default; }
+
 #ss-img {
   width: 100%;
   height: 100%;
@@ -544,7 +559,7 @@ html.ss-hide-playbar [data-playbar="true"] {
 #ss-overlay.ss-minimized #ss-song-title { font-size: 13px; -webkit-line-clamp: 1; }
 #ss-overlay.ss-minimized #ss-sub { font-size: 11px; }
 
-#ss-overlay.ss-minimized #ss-progress,
+#ss-overlay.ss-minimized #ss-times,
 #ss-overlay.ss-minimized #ss-bottom,
 #ss-overlay.ss-minimized #ss-prev,
 #ss-overlay.ss-minimized #ss-backdrop { display: none; }
@@ -561,16 +576,39 @@ html.ss-hide-playbar [data-playbar="true"] {
 #ss-overlay.ss-minimized #ss-play-pause { width: 36px; height: 36px; padding: 9px; }
 #ss-overlay.ss-minimized .ss-ctrl { width: 32px; height: 32px; padding: 7px; }
 
-/* Thin progress line along the bottom edge when minimized */
-#ss-overlay.ss-minimized::after {
-  content: '';
+/* Minimized: the timeline becomes a slim, still seekable strip along the bottom edge */
+#ss-overlay.ss-minimized #ss-progress {
   position: absolute;
   left: 0;
+  right: 0;
   bottom: 0;
-  height: 2px;
-  width: var(--ss-progress);
-  background: linear-gradient(90deg, var(--ss-accent), var(--ss-accent-2));
+  gap: 0;
 }
+
+#ss-overlay.ss-minimized #ss-progress-bar { height: 12px; }
+
+#ss-overlay.ss-minimized #ss-progress-bar::before,
+#ss-overlay.ss-minimized #ss-progress-fill {
+  top: auto;
+  bottom: 0;
+  height: 3px;
+  border-radius: 0;
+  transform: none;
+}
+
+#ss-overlay.ss-minimized #ss-progress-bar:hover::before,
+#ss-overlay.ss-minimized #ss-progress-bar:hover #ss-progress-fill,
+#ss-overlay.ss-minimized.ss-seeking #ss-progress-bar::before,
+#ss-overlay.ss-minimized.ss-seeking #ss-progress-fill { height: 6px; }
+
+#ss-overlay.ss-minimized #ss-progress-thumb {
+  top: auto;
+  bottom: -3px;
+  transform: translateX(-50%) scale(0);
+}
+
+#ss-overlay.ss-minimized #ss-progress-bar:hover #ss-progress-thumb,
+#ss-overlay.ss-minimized.ss-seeking #ss-progress-thumb { transform: translateX(-50%) scale(1); }
 
 #ss-overlay.ss-minimized.ss-scanning #ss-scan-hint { display: none !important; }
 

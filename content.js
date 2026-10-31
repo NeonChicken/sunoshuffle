@@ -35,6 +35,11 @@
   let currentIndex = 0;
   let currentTotal = 0;
   let starting = false;          // true while we are switching Suno's player to a new song
+  let suppressForeignPlay = false; // pause anything Suno auto-plays until we press Play ourselves
+  const AUTOPLAY_KEY = 'ssAutoplay'; // survives a full page reload during a song switch
+  const AUTOPLAY_TTL = 45000;
+
+  function log(...args) { console.info('[SunoShuffle]', ...args); }
   let awaitingGesture = false;   // autoplay was blocked; next ▶ click retries currentSong
 
   let shuffleActive = false;
@@ -317,6 +322,19 @@
     });
 
     makeDraggable(overlay, overlay.querySelector('#ss-header'));
+
+    chromeSafe(() => {
+      chrome.runtime.sendMessage({ type: 'IS_DEV' }, (res) => {
+        if (chrome.runtime.lastError || !res?.dev) return;
+        const bar = overlay.querySelector('#ss-title-bar');
+        if (bar && !bar.querySelector('.ss-dev-tag')) {
+          const tag = document.createElement('span');
+          tag.className = 'ss-dev-tag';
+          tag.textContent = 'DEV';
+          bar.appendChild(tag);
+        }
+      });
+    });
   }
 
   function makeDraggable(el, handle) {
@@ -458,14 +476,23 @@
   async function startOnSunoPlayer(song, gen) {
     const path = `/song/${song.id}`;
 
+    // Silence whatever Suno queued up itself (e.g. its own auto-advance at track end).
+    suppressForeignPlay = true;
+    const p0 = getPlayer();
+    if (p0 && !p0.paused) p0.pause();
+
+    // If the switch turns into a full page reload, the freshly injected content script
+    // picks this up and continues playing instead of sitting paused.
+    await storageSet({ [AUTOPLAY_KEY]: { id: song.id, at: Date.now(), failures: consecutiveFailures } });
+    if (gen !== playGen) return 'stale';
+
     if (location.pathname !== path) {
       // Mark the current page's Play buttons so we don't click a stale one mid-transition.
       songPlayButtons().forEach(b => { b.dataset.ssStale = '1'; });
       const navOk = await routerNavigate(path);
+      log('navigate', path, navOk ? 'via router' : 'router unavailable → full load');
       if (gen !== playGen) return 'stale';
       if (!navOk) {
-        // Router not reachable — fall back to a full page load. The overlay restores in a
-        // paused state (currentSong is already stored) and ▶ resumes from there.
         location.assign(path);
         return 'reload';
       }
@@ -481,6 +508,8 @@
 
     for (let attempt = 0; attempt < 2; attempt++) {
       const prevSrc = getPlayer()?.currentSrc || '';
+      suppressForeignPlay = false;
+      log('pressing Play for', song.id, attempt ? '(retry)' : '');
       btn.click();
       if (await waitFor(() => isPlayingNewSource(prevSrc) || gen !== playGen, 10000, 200)) {
         return gen !== playGen ? 'stale' : 'playing';
@@ -513,8 +542,12 @@
       result = 'failed';
     }
     if (gen !== playGen || result === 'stale') return;   // a newer song already took over
+    log('start result:', result);
+    if (result === 'reload') return;   // page is reloading; the AUTOPLAY_KEY marker takes over
     starting = false;
+    suppressForeignPlay = false;
     setSpinner(false);
+    chromeSafe(() => chrome.storage.local.remove(AUTOPLAY_KEY));
 
     if (result === 'playing') {
       const p = getPlayer();
@@ -613,6 +646,7 @@
   function skipSong() {
     if (!shuffleActive || navigating) return;
     navigating = true;
+    suppressForeignPlay = true;
     playGen++;              // invalidate any in-flight start of the previous song
     stopProgressTracking();
     advanceQueue();
@@ -621,6 +655,7 @@
   function prevSong() {
     if (!shuffleActive || navigating) return;
     navigating = true;
+    suppressForeignPlay = true;
     playGen++;
     stopProgressTracking();
     chromeSafe(() => {
@@ -651,7 +686,9 @@
     navigating = false;
     starting = false;
     awaitingGesture = false;
+    suppressForeignPlay = false;
     playGen++;
+    chromeSafe(() => chrome.storage.local.remove(AUTOPLAY_KEY));
     const p = getPlayer();
     if (p && !p.paused) p.pause();
     stopProgressTracking();
@@ -720,14 +757,18 @@
   }
 
   onPlayerEvent('ended', () => {
-    if (shuffleActive && !navigating && !starting && currentSong) advanceQueue();
+    if (shuffleActive && !navigating && !starting && currentSong) {
+      suppressForeignPlay = true;   // block Suno's own auto-advance immediately
+      advanceQueue();
+    }
   });
   onPlayerEvent('pause', () => {
     if (!shuffleActive || starting) return;
     if (playPauseBtn) playPauseBtn.textContent = '\u25b6';
   });
-  onPlayerEvent('play', () => {
+  onPlayerEvent('play', (p) => {
     if (!shuffleActive) return;
+    if (suppressForeignPlay) { p.pause(); return; }
     if (playPauseBtn) playPauseBtn.textContent = '\u23f8';
     startProgressTracking();
   });
@@ -802,8 +843,23 @@
   // ─── Restore overlay on page navigation ───────────────────────────────────
 
   chromeSafe(() => {
-    chrome.storage.local.get(['queue', 'currentSong'], (data) => {
+    chrome.storage.local.get(['queue', 'currentSong', 'queueIndex', AUTOPLAY_KEY], (data) => {
       if (!data) return;
+
+      // A song switch turned into a full page reload: keep the shuffle going.
+      const ap = data[AUTOPLAY_KEY];
+      if (ap) chrome.storage.local.remove(AUTOPLAY_KEY);
+      if (ap && data.currentSong && ap.id === data.currentSong.id &&
+          Date.now() - ap.at < AUTOPLAY_TTL && location.pathname === `/song/${ap.id}`) {
+        log('page reloaded mid-switch — resuming', ap.id);
+        consecutiveFailures = ap.failures || 0;
+        shuffleActive = true;
+        createOverlay();
+        overlay.style.display = 'block';
+        playSong(data.currentSong, Math.max(0, (data.queueIndex || 1) - 1), (data.queue || []).length);
+        return;
+      }
+
       if (data.currentSong || (data.queue && data.queue.length > 0)) {
         createOverlay();
         if (data.currentSong) {
@@ -823,5 +879,14 @@
   // ─── Utilities ─────────────────────────────────────────────────────────────
 
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function storageSet(obj) {
+    return new Promise((resolve) => {
+      try {
+        if (!chrome.runtime?.id) return resolve();
+        chrome.storage.local.set(obj, () => resolve());
+      } catch (e) { resolve(); }
+    });
+  }
 
 })();

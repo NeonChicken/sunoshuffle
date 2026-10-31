@@ -1,5 +1,28 @@
 // background.js — Service worker: queue management only (no API calls)
 
+// ─── DEV marker ───────────────────────────────────────────────────────────────
+// Unpacked ("Load unpacked") installs report installType 'development'; the Web Store
+// build never does, so no build step is needed to strip this.
+
+async function isDevBuild() {
+  try {
+    return (await chrome.management.getSelf()).installType === 'development';
+  } catch (e) {
+    return false;
+  }
+}
+
+async function markDevBuild() {
+  if (!(await isDevBuild())) return;
+  chrome.action.setBadgeText({ text: 'DEV' });
+  chrome.action.setBadgeBackgroundColor({ color: '#d97706' });
+  chrome.action.setTitle({ title: 'Suno Shuffle (DEV build)' });
+}
+
+chrome.runtime.onInstalled.addListener(markDevBuild);
+chrome.runtime.onStartup.addListener(markDevBuild);
+markDevBuild();
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function normalizeTitle(title) {
@@ -73,6 +96,12 @@ function constrainedShuffle(songs) {
 // ─── Message handlers ─────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+
+  // ── IS_DEV — content script can't call chrome.management itself ──────────
+  if (message.type === 'IS_DEV') {
+    isDevBuild().then(dev => sendResponse({ dev }));
+    return true;
+  }
 
   // ── BUILD_QUEUE — called by content script after DOM scraping ─────────────
   if (message.type === 'BUILD_QUEUE') {

@@ -1,5 +1,14 @@
 // popup.js
 
+// DEV tag for unpacked installs (never shown in the Web Store build)
+chrome.management.getSelf().then((self) => {
+  if (self.installType !== 'development') return;
+  const tag = document.createElement('span');
+  tag.className = 'dev-tag';
+  tag.textContent = 'DEV';
+  document.getElementById('app-name').appendChild(tag);
+}).catch(() => {});
+
 const btnStart      = document.getElementById('btn-start');
 const btnResume     = document.getElementById('btn-resume');
 const btnReshuffle  = document.getElementById('btn-reshuffle');

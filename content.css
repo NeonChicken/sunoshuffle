@@ -270,3 +270,14 @@
   width: auto;
   min-width: 160px;
 }
+
+#ss-overlay .ss-dev-tag {
+  margin-left: 6px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: #d97706;
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}

@@ -39,6 +39,18 @@ Press **Shuffle this page** again to rescan and re-randomize. Songs already play
 
 Click **Clear history** to wipe everything and start fresh on your next **Start Shuffle**.
 
+## Building a release
+
+1. Bump `version` in `manifest.json`.
+2. In PowerShell, from the repo folder:
+   ```powershell
+   .uild.ps1 -KeyPath "path	o\privatekey.pem"
+   ```
+   This stages only the runtime files in `dist\suno-shuffle-<version>\`, zips them, and signs
+   `dist\Suno Shuffle v<version>.crx` with your key (for Verified CRX Uploads).
+   Without `-KeyPath` it only builds the zip.
+3. Upload the `.crx` in the Chrome Web Store Developer Dashboard.
+
 ## How the shuffle works
 
 Songs are shuffled using a constrained Fisher-Yates algorithm. After the initial shuffle, multiple passes fix any positions where two songs with the same normalized title (suffixes stripped) would play consecutively. This ensures that, for example, *"My Song"*, *"My Song (Edit)"*, and *"My Song (FAV)"* are always separated in the queue.

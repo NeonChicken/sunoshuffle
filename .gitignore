@@ -3,3 +3,4 @@ generate-icons.html
 generate-icons.js
 *.pem
 *.crx
+dist/

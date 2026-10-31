@@ -366,7 +366,7 @@
   // ─── Overlay UI ────────────────────────────────────────────────────────────
 
   const ICON = {
-    logo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15l6 6"/><path d="M4 4l5 5"/></svg>',
+    logo: '<svg viewBox="0 0 24 24" aria-hidden="true"><defs><linearGradient id="ss-logo-grad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff9a00"/><stop offset="1" stop-color="#ffcc00"/></linearGradient></defs><circle cx="12" cy="12" r="7.25" fill="none" stroke="url(#ss-logo-grad)" stroke-width="5.5"/></svg>',
     play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.6v12.8a1 1 0 0 0 1.52.85l10.2-6.4a1 1 0 0 0 0-1.7L9.52 4.75A1 1 0 0 0 8 5.6z"/></svg>',
     pause: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6.5" y="5" width="4" height="14" rx="1.2"/><rect x="13.5" y="5" width="4" height="14" rx="1.2"/></svg>',
     prev: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="6" width="2.2" height="12" rx="1"/><path d="M18.5 6.9v10.2a.9.9 0 0 1-1.4.74L9.4 12.74a.9.9 0 0 1 0-1.48l7.7-5.1a.9.9 0 0 1 1.4.74z"/></svg>',

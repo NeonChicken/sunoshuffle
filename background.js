@@ -15,7 +15,7 @@ async function isDevBuild() {
 async function markDevBuild() {
   if (!(await isDevBuild())) return;
   chrome.action.setBadgeText({ text: 'DEV' });
-  chrome.action.setBadgeBackgroundColor({ color: '#d97706' });
+  chrome.action.setBadgeBackgroundColor({ color: '#0ea5e9' });
   chrome.action.setTitle({ title: 'Suno Shuffle (DEV build)' });
 }
 

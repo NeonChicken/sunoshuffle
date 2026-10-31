@@ -8,8 +8,9 @@
   --text: #f4f4f6;
   --muted: #a1a1aa;
   --faint: #71717a;
-  --accent: #a78bfa;
-  --accent-2: #f472b6;
+  --accent: #ff9e00;
+  --accent-2: #ffc800;
+  --on-accent: #1f1400;
   --danger: #f87171;
   --ok: #4ade80;
 }
@@ -42,10 +43,7 @@ header {
 #logo {
   width: 30px;
   height: 30px;
-  padding: 7px;
-  border-radius: 9px;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  color: #fff;
+  flex-shrink: 0;
 }
 
 #logo svg { display: block; width: 100%; height: 100%; }
@@ -61,7 +59,7 @@ header {
   margin-left: 8px;
   padding: 1px 5px;
   border-radius: 4px;
-  background: #d97706;
+  background: #0ea5e9;
   color: #fff;
   font-size: 10px;
   font-weight: 700;
@@ -167,8 +165,8 @@ header {
 .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .btn-primary {
-  background: #fff;
-  color: #111;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  color: var(--on-accent);
 }
 
 .btn-primary:hover:not(:disabled) { opacity: 0.9; }
@@ -200,7 +198,7 @@ header {
   align-items: flex-start;
   padding: 9px 10px;
   border-radius: 10px;
-  background: rgba(167, 139, 250, 0.08);
+  background: rgba(255, 170, 0, 0.08);
   font-size: 11.5px;
   line-height: 1.45;
   color: var(--muted);

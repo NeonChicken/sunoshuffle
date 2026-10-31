@@ -15,8 +15,9 @@ html.ss-hide-playbar [data-playbar="true"] {
   --ss-text: #f4f4f6;
   --ss-muted: #a1a1aa;
   --ss-faint: #71717a;
-  --ss-accent: #a78bfa;
-  --ss-accent-2: #f472b6;
+  --ss-accent: #ff9e00;     /* icon gradient: orange → amber */
+  --ss-accent-2: #ffc800;
+  --ss-on-accent: #1f1400;
   --ss-progress: 0%;
   --ss-vol: 100%;
 
@@ -104,10 +105,9 @@ html.ss-hide-playbar [data-playbar="true"] {
 #ss-overlay.ss-dragging #ss-header { cursor: grabbing; }
 
 #ss-logo {
-  width: 14px;
-  height: 14px;
+  width: 15px;
+  height: 15px;
   flex-shrink: 0;
-  color: var(--ss-accent);
 }
 
 #ss-heading {
@@ -142,7 +142,7 @@ html.ss-hide-playbar [data-playbar="true"] {
   flex-shrink: 0;
   padding: 1px 5px;
   border-radius: 4px;
-  background: #d97706;
+  background: #0ea5e9;
   color: #fff;
   font-size: 9px;
   font-weight: 700;
@@ -273,8 +273,8 @@ html.ss-hide-playbar [data-playbar="true"] {
   gap: 10px;
   padding: 8px 8px 8px 12px;
   border-radius: 10px;
-  background: rgba(167, 139, 250, 0.12);
-  border: 1px solid rgba(167, 139, 250, 0.25);
+  background: rgba(255, 170, 0, 0.1);
+  border: 1px solid rgba(255, 170, 0, 0.28);
   font-size: 12px;
   color: var(--ss-text);
 }
@@ -285,8 +285,8 @@ html.ss-hide-playbar [data-playbar="true"] {
   flex-shrink: 0;
   padding: 5px 12px;
   border-radius: 999px;
-  background: #fff;
-  color: #111;
+  background: linear-gradient(135deg, var(--ss-accent), var(--ss-accent-2));
+  color: var(--ss-on-accent);
   font-size: 12px;
   font-weight: 600;
   transition: transform 0.1s, opacity 0.15s;
@@ -387,9 +387,9 @@ html.ss-hide-playbar [data-playbar="true"] {
   height: 50px;
   padding: 13px;
   border-radius: 50%;
-  background: #fff;
-  color: #111;
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+  background: linear-gradient(135deg, var(--ss-accent), var(--ss-accent-2));
+  color: var(--ss-on-accent);
+  box-shadow: 0 6px 18px rgba(255, 158, 0, 0.28), 0 2px 6px rgba(0, 0, 0, 0.4);
   transition: transform 0.12s, box-shadow 0.15s;
 }
 
@@ -418,7 +418,7 @@ html.ss-hide-playbar [data-playbar="true"] {
   height: 4px;
   margin: 0;
   border-radius: 999px;
-  background: linear-gradient(90deg, rgba(255, 255, 255, 0.75) var(--ss-vol), rgba(255, 255, 255, 0.14) var(--ss-vol));
+  background: linear-gradient(90deg, var(--ss-accent) 0%, var(--ss-accent-2) var(--ss-vol), rgba(255, 255, 255, 0.14) var(--ss-vol));
   outline: none;
   cursor: pointer;
 }

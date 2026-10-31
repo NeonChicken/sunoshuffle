@@ -35,6 +35,8 @@
   let currentIndex = 0;
   let currentTotal = 0;
   let starting = false;          // true while we are switching Suno's player to a new song
+  let sourcePath = null;         // the playlist/library page the shuffle was started from
+  let loadedSongId = null;       // song we last loaded into Suno's player
   let suppressForeignPlay = false; // pause anything Suno auto-plays until we press Play ourselves
   const AUTOPLAY_KEY = 'ssAutoplay'; // survives a full page reload during a song switch
   const AUTOPLAY_TTL = 45000;
@@ -469,56 +471,139 @@
     return !!(p && !p.paused && p.currentSrc && p.currentSrc !== prevSrc);
   }
 
+  /** The row cover button ("Play <title>") of a song rendered in a list on this page. */
+  function findRowPlayButton(id) {
+    for (const a of document.querySelectorAll(`a[href*="/song/${id}"]`)) {
+      if (a.closest('#ss-overlay')) continue;
+      const b = findSongRow(a, id).querySelector('[role="button"][aria-label^="Play "]');
+      if (b) return b;
+    }
+    return null;
+  }
+
+  function pageHasSongList() {
+    return document.querySelectorAll('a[href*="/song/"]').length > 1;
+  }
+
+  /** Scroll the list (virtualized / lazily loaded) until the song's row is rendered. */
+  async function scrollToFindRow(id, gen) {
+    const scrollEl = findScrollContainer() || document.scrollingElement;
+    if (!scrollEl) return null;
+    const startTop = scrollEl.scrollTop;
+    const deadline = Date.now() + 60000;
+    const passes = startTop > 0 ? [startTop, 0] : [0];
+    for (const from of passes) {
+      scrollEl.scrollTop = from;
+      while (Date.now() < deadline) {
+        await sleep(250);
+        if (gen !== playGen) return null;
+        const b = findRowPlayButton(id);
+        if (b) { b.scrollIntoView({ block: 'center' }); return b; }
+        const before = scrollEl.scrollTop;
+        scrollEl.scrollTop += Math.max(300, scrollEl.clientHeight * 0.8);
+        if (scrollEl.scrollTop === before) {
+          await sleep(1500);                      // at the bottom: give lazy loading a chance
+          if (findRowPlayButton(id)) continue;
+          scrollEl.scrollTop += 300;
+          if (scrollEl.scrollTop === before) break;
+        }
+      }
+    }
+    scrollEl.scrollTop = startTop;
+    return null;
+  }
+
+  /** Client-side navigate. Resolves 'ok' | 'failed' | 'reload' | 'stale'. */
+  async function softNavigate(path, gen) {
+    const navOk = await routerNavigate(path);
+    log('navigate', path, navOk ? 'via router' : 'router unavailable \u2192 full load');
+    if (gen !== playGen) return 'stale';
+    if (!navOk) { location.assign(path); return 'reload'; }
+    return await waitFor(() => location.pathname === path, 6000) ? 'ok' : 'failed';
+  }
+
+  /** Find something to press that plays `song`, preferring to stay on the current page. */
+  async function locatePlayControl(song, gen) {
+    const id = song.id;
+    const songPath = `/song/${id}`;
+
+    // 1. Row in the list on the current page (no navigation at all).
+    let btn = findRowPlayButton(id);
+    if (btn) return { btn, how: 'row on this page' };
+
+    // 2. Already on the song's own page.
+    if (location.pathname === songPath) {
+      btn = await waitFor(() => songPlayButtons()[0], 4000);
+      if (btn) return { btn, how: 'song page' };
+    }
+
+    // 3. Scroll this list (the shuffle source) to render the row.
+    if (pageHasSongList() && (!sourcePath || location.pathname === sourcePath)) {
+      btn = await scrollToFindRow(id, gen);
+      if (gen !== playGen) return { result: 'stale' };
+      if (btn) return { btn, how: 'row after scrolling' };
+    }
+
+    // 4. Go back to the playlist/library the shuffle was started from.
+    if (sourcePath && location.pathname !== sourcePath) {
+      const r = await softNavigate(sourcePath, gen);
+      if (r === 'stale' || r === 'reload') return { result: r };
+      if (r === 'ok') {
+        btn = await waitFor(() => findRowPlayButton(id), 8000);
+        if (gen !== playGen) return { result: 'stale' };
+        if (!btn && pageHasSongList()) btn = await scrollToFindRow(id, gen);
+        if (gen !== playGen) return { result: 'stale' };
+        if (btn) return { btn, how: 'row on source list' };
+      }
+    }
+
+    // 5. Last resort: the song's own page.
+    songPlayButtons().forEach(b => { b.dataset.ssStale = '1'; });
+    const r = await softNavigate(songPath, gen);
+    if (r !== 'ok') return { result: r };
+    btn = await waitFor(() => songPlayButtons().find(b => !b.dataset.ssStale), 6000) || songPlayButtons()[0];
+    if (gen !== playGen) return { result: 'stale' };
+    return btn ? { btn, how: 'song page (fallback)' } : { result: 'failed' };
+  }
+
   /**
    * Make Suno's player play `song`.
    * Resolves to 'playing' | 'blocked' (autoplay policy needs a user click) | 'failed' | 'reload' | 'stale'.
    */
   async function startOnSunoPlayer(song, gen) {
-    const path = `/song/${song.id}`;
-
     // Silence whatever Suno queued up itself (e.g. its own auto-advance at track end).
     suppressForeignPlay = true;
     const p0 = getPlayer();
     if (p0 && !p0.paused) p0.pause();
 
-    // If the switch turns into a full page reload, the freshly injected content script
+    // If anything turns into a full page reload, the freshly injected content script
     // picks this up and continues playing instead of sitting paused.
     await storageSet({ [AUTOPLAY_KEY]: { id: song.id, at: Date.now(), failures: consecutiveFailures } });
     if (gen !== playGen) return 'stale';
 
-    if (location.pathname !== path) {
-      // Mark the current page's Play buttons so we don't click a stale one mid-transition.
-      songPlayButtons().forEach(b => { b.dataset.ssStale = '1'; });
-      const navOk = await routerNavigate(path);
-      log('navigate', path, navOk ? 'via router' : 'router unavailable → full load');
-      if (gen !== playGen) return 'stale';
-      if (!navOk) {
-        location.assign(path);
-        return 'reload';
-      }
-      if (!await waitFor(() => location.pathname === path, 6000)) return 'failed';
-    } else {
-      songPlayButtons().forEach(b => { delete b.dataset.ssStale; });
-    }
-
-    let btn = await waitFor(() => songPlayButtons().find(b => !b.dataset.ssStale), 6000);
+    const found = await locatePlayControl(song, gen);
     if (gen !== playGen) return 'stale';
-    if (!btn) btn = songPlayButtons()[0];   // DOM node may have been reused across pages
-    if (!btn) return 'failed';
+    if (!found.btn) return found.result || 'failed';
+    let btn = found.btn;
 
     for (let attempt = 0; attempt < 2; attempt++) {
       const prevSrc = getPlayer()?.currentSrc || '';
       suppressForeignPlay = false;
-      log('pressing Play for', song.id, attempt ? '(retry)' : '');
+      log('pressing Play for', song.id, '\u2014', found.how, attempt ? '(retry)' : '');
       btn.click();
-      if (await waitFor(() => isPlayingNewSource(prevSrc) || gen !== playGen, 10000, 200)) {
-        return gen !== playGen ? 'stale' : 'playing';
-      }
+      const ok = await waitFor(() => {
+        if (gen !== playGen) return true;
+        const p = getPlayer();
+        if (!p || p.paused || !p.currentSrc) return false;
+        // New source, or this very song was already loaded and just resumed.
+        return p.currentSrc !== prevSrc || loadedSongId === song.id;
+      }, 10000, 200);
       if (gen !== playGen) return 'stale';
+      if (ok) { loadedSongId = song.id; return 'playing'; }
       const p = getPlayer();
-      // Source loaded but not playing → autoplay policy blocked the start.
-      if (p && p.currentSrc && p.currentSrc !== prevSrc && p.paused) return 'blocked';
-      btn = songPlayButtons()[0] || btn;
+      // Source loaded but not playing -> autoplay policy blocked the start.
+      if (p && p.currentSrc && p.currentSrc !== prevSrc && p.paused) { loadedSongId = song.id; return 'blocked'; }
+      btn = findRowPlayButton(song.id) || songPlayButtons()[0] || btn;
     }
     return 'failed';
   }
@@ -708,6 +793,8 @@
 
   async function startShuffle() {
     shuffleActive = true;
+    sourcePath = location.pathname;
+    chromeSafe(() => chrome.storage.local.set({ sourcePath }));
     createOverlay();
     overlay.style.display = 'block';
 
@@ -843,14 +930,15 @@
   // ─── Restore overlay on page navigation ───────────────────────────────────
 
   chromeSafe(() => {
-    chrome.storage.local.get(['queue', 'currentSong', 'queueIndex', AUTOPLAY_KEY], (data) => {
+    chrome.storage.local.get(['queue', 'currentSong', 'queueIndex', 'sourcePath', AUTOPLAY_KEY], (data) => {
       if (!data) return;
+      if (data.sourcePath && !sourcePath) sourcePath = data.sourcePath;
 
       // A song switch turned into a full page reload: keep the shuffle going.
       const ap = data[AUTOPLAY_KEY];
       if (ap) chrome.storage.local.remove(AUTOPLAY_KEY);
       if (ap && data.currentSong && ap.id === data.currentSong.id &&
-          Date.now() - ap.at < AUTOPLAY_TTL && location.pathname === `/song/${ap.id}`) {
+          Date.now() - ap.at < AUTOPLAY_TTL) {
         log('page reloaded mid-switch — resuming', ap.id);
         consecutiveFailures = ap.failures || 0;
         shuffleActive = true;

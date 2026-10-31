@@ -43,5 +43,5 @@ Songs are shuffled using a constrained Fisher-Yates algorithm. After the initial
 ## Notes
 
 - The extension only works on `suno.com` pages.
-- Audio is played directly from Suno's CDN — no API keys or authentication required.
-- The extension does not interact with or modify Suno's own player.
+- Playback goes through Suno's own player: the extension opens each song's page (client-side, no reload) and presses Play, then follows the player for progress and end-of-track. No API keys or extra authentication required.
+- While shuffling, the tab moves to the page of the song that's playing.

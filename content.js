@@ -23,9 +23,19 @@
     }
   }
 
-  // ─── State ─────────────────────────────────────────────────────────────────
-  let audio = new Audio();
-  audio.preload = 'auto';
+  // ─── Suno's native player ──────────────────────────────────────────────────
+  // Suno no longer serves plain MP3s (cdn1/cdn2 URLs return 403 and the new media files
+  // are only playable through Suno's own player). So instead of running our own <audio>,
+  // we drive Suno's player: navigate to the song page, press its Play button, and observe
+  // this element for progress / end-of-track.
+  const PLAYER_ID = 'active-audio-play';
+  function getPlayer() { return document.getElementById(PLAYER_ID); }
+
+  let savedVolume = null;        // user's overlay volume (0..1), applied to Suno's player
+  let currentIndex = 0;
+  let currentTotal = 0;
+  let starting = false;          // true while we are switching Suno's player to a new song
+  let awaitingGesture = false;   // autoplay was blocked; next ▶ click retries currentSong
 
   let shuffleActive = false;
   let currentSong   = null;
@@ -40,38 +50,53 @@
 
   // ─── DOM Scraping ──────────────────────────────────────────────────────────
 
+  const SONG_HREF_RE = /\/song\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+  // Song ids whose title came from the song link text itself (most reliable source).
+  const strongTitleIds = new Set();
+
   function scrapeVisibleSongs(accumulator) {
-    // Strategy 1: elements with data-clip-id attribute (most precise)
+    // Strategy 1: elements with data-clip-id attribute (older Suno markup; harmless if absent)
     document.querySelectorAll('[data-clip-id]').forEach(el => {
       const id = el.getAttribute('data-clip-id');
       if (!id || accumulator.has(id)) return;
       const title = extractTitle(el) || `Song ${id.slice(0, 8)}`;
-      const image_url = extractImage(el, id);
-      accumulator.set(id, { id, title, audio_url: `https://cdn1.suno.ai/${id}.mp3`, image_url });
+      accumulator.set(id, { id, title, image_url: extractImage(el, id) });
     });
 
-    // Strategy 2: anchor links pointing to /song/{uuid}
+    // Strategy 2: anchor links pointing to /song/{uuid}.
+    // Current Suno markup: <a href="/song/{id}">Title</a> inside an unattributed row div.
+    // (Thumbnail UUIDs are NOT clip ids anymore, so images are never used to discover songs.)
     document.querySelectorAll('a[href*="/song/"]').forEach(a => {
-      const m = a.href.match(/\/song\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+      if (a.closest('#ss-overlay')) return;
+      const m = (a.getAttribute('href') || '').match(SONG_HREF_RE);
       if (!m) return;
-      const id = m[1];
-      if (accumulator.has(id)) return;
-      const container = a.closest('[data-clip-id]') || a.closest('li') || a.closest('[role="row"]') || a.parentElement;
-      const title = (container ? extractTitle(container) : null) || `Song ${id.slice(0, 8)}`;
-      const image_url = container ? extractImage(container, id) : null;
-      accumulator.set(id, { id, title, audio_url: `https://cdn1.suno.ai/${id}.mp3`, image_url });
-    });
+      const id = m[1].toLowerCase();
 
-    // Strategy 3: CDN thumbnail images whose src contains a UUID
-    document.querySelectorAll('img[src*="suno"]').forEach(img => {
-      const m = (img.src || '').match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-      if (!m) return;
-      const id = m[1];
-      if (accumulator.has(id)) return;
-      const container = img.closest('[data-clip-id]') || img.closest('li') || img.closest('[role="row"]') || img.parentElement;
-      const title = (container ? extractTitle(container) : null) || `Song ${id.slice(0, 8)}`;
-      accumulator.set(id, { id, title, audio_url: `https://cdn1.suno.ai/${id}.mp3`, image_url: img.src });
+      const linkText = a.textContent.trim();
+      const hasLinkTitle = linkText.length >= 1 && linkText.length <= 150 && !isDurationString(linkText);
+      const existing = accumulator.get(id);
+      if (existing && (strongTitleIds.has(id) || !hasLinkTitle)) return;
+
+      const container = findSongRow(a, id);
+      const title = hasLinkTitle ? linkText : (extractTitle(container) || `Song ${id.slice(0, 8)}`);
+      if (hasLinkTitle) strongTitleIds.add(id);
+      accumulator.set(id, { id, title, image_url: existing?.image_url || extractImage(container, id) });
     });
+  }
+
+  /** Walk up from a song link to the largest ancestor that only references this one song. */
+  function findSongRow(a, id) {
+    let row = a;
+    for (let depth = 0; depth < 8 && row.parentElement && row.parentElement !== document.body; depth++) {
+      const parent = row.parentElement;
+      const otherSong = [...parent.querySelectorAll('a[href*="/song/"]')].some(x => {
+        const m = (x.getAttribute('href') || '').match(SONG_HREF_RE);
+        return m && m[1].toLowerCase() !== id;
+      });
+      if (otherSong) break;
+      row = parent;
+    }
+    return row;
   }
 
   function extractTitle(container) {
@@ -110,9 +135,12 @@
   }
 
   function extractImage(container, id) {
-    if (!container) return `https://cdn2.suno.ai/image_${id}.jpeg`;
-    const img = container.querySelector('img');
-    return img?.src || `https://cdn2.suno.ai/image_${id}.jpeg`;
+    const fallback = `https://cdn2.suno.ai/image_${id}.jpeg`;
+    if (!container) return fallback;
+    const img = container.querySelector('img[src*="suno"]') || container.querySelector('img');
+    if (!img?.src) return fallback;
+    // List thumbnails are requested at ?width=100 — ask for a sharper one for the overlay.
+    return img.src.replace(/([?&]width=)\d+/, '$1360');
   }
 
   /**
@@ -141,6 +169,7 @@
    */
   async function loadAllSongsFromCurrentPage() {
     scanCancelled = false;
+    strongTitleIds.clear();
     const songs = new Map();
     let lastSize = -1;
     let staleRounds = 0;
@@ -266,7 +295,7 @@
           overlay.querySelector('#ss-minimize').textContent = '+';
         }
         if (data.overlayVolume != null) {
-          audio.volume = data.overlayVolume;
+          savedVolume = data.overlayVolume;
           if (volumeSlider) volumeSlider.value = Math.round(data.overlayVolume * 100);
         }
       });
@@ -281,7 +310,9 @@
     overlay.querySelector('#ss-cancel-scan').addEventListener('click', () => { scanCancelled = true; });
     overlay.querySelector('#ss-volume-slider').addEventListener('input', (e) => {
       const v = e.target.value / 100;
-      audio.volume = v;
+      savedVolume = v;
+      const p = getPlayer();
+      if (p) p.volume = v;
       chromeSafe(() => chrome.storage.local.set({ overlayVolume: v }));
     });
 
@@ -347,10 +378,11 @@
   }
 
   function updateProgress() {
-    if (!audio.duration) return;
-    const ratio = audio.currentTime / audio.duration;
+    const p = getPlayer();
+    if (!p || !p.duration || !isFinite(p.duration)) return;
+    const ratio = p.currentTime / p.duration;
     if (progressFill) progressFill.style.width = (ratio * 100) + '%';
-    if (timeEl) timeEl.textContent = formatTime(audio.currentTime) + ' / ' + formatTime(audio.duration);
+    if (timeEl) timeEl.textContent = formatTime(p.currentTime) + ' / ' + formatTime(p.duration);
   }
 
   function startProgressTracking() {
@@ -376,50 +408,141 @@
   }
 
   function seekTo(e) {
-    if (!audio.duration) return;
+    const p = getPlayer();
+    if (!p || !p.duration || !isFinite(p.duration)) return;
     const rect = e.currentTarget.getBoundingClientRect();
-    audio.currentTime = ((e.clientX - rect.left) / rect.width) * audio.duration;
+    p.currentTime = ((e.clientX - rect.left) / rect.width) * p.duration;
   }
 
-  // ─── Playback ──────────────────────────────────────────────────────────────
+  // ─── Playback (via Suno's player) ──────────────────────────────────────────
 
-  function pauseSunoNativePlayer() {
-    document.querySelectorAll('audio').forEach(el => {
-      if (el !== audio && !el.paused) el.pause();
+  /** Ask the MAIN-world bridge to client-side navigate (no page reload). */
+  function routerNavigate(path) {
+    return new Promise((resolve) => {
+      const reqId = Math.random().toString(36).slice(2);
+      const timer = setTimeout(() => { window.removeEventListener('message', onMsg); resolve(false); }, 1500);
+      function onMsg(e) {
+        if (e.source !== window || !e.data || e.data.__ssBridge !== 'nav-result' || e.data.reqId !== reqId) return;
+        window.removeEventListener('message', onMsg);
+        clearTimeout(timer);
+        resolve(!!e.data.ok);
+      }
+      window.addEventListener('message', onMsg);
+      window.postMessage({ __ssBridge: 'nav', reqId, path }, location.origin);
     });
   }
 
-  function playSong(song, index, total) {
+  async function waitFor(fn, timeout, interval = 150) {
+    const end = Date.now() + timeout;
+    while (Date.now() < end) {
+      const v = fn();
+      if (v) return v;
+      await sleep(interval);
+    }
+    return null;
+  }
+
+  function songPlayButtons() {
+    return [...document.querySelectorAll('button[aria-label="Play"]')].filter(b => !b.closest('#ss-overlay'));
+  }
+
+  function isPlayingNewSource(prevSrc) {
+    const p = getPlayer();
+    return !!(p && !p.paused && p.currentSrc && p.currentSrc !== prevSrc);
+  }
+
+  /**
+   * Make Suno's player play `song`.
+   * Resolves to 'playing' | 'blocked' (autoplay policy needs a user click) | 'failed' | 'reload' | 'stale'.
+   */
+  async function startOnSunoPlayer(song, gen) {
+    const path = `/song/${song.id}`;
+
+    if (location.pathname !== path) {
+      // Mark the current page's Play buttons so we don't click a stale one mid-transition.
+      songPlayButtons().forEach(b => { b.dataset.ssStale = '1'; });
+      const navOk = await routerNavigate(path);
+      if (gen !== playGen) return 'stale';
+      if (!navOk) {
+        // Router not reachable — fall back to a full page load. The overlay restores in a
+        // paused state (currentSong is already stored) and ▶ resumes from there.
+        location.assign(path);
+        return 'reload';
+      }
+      if (!await waitFor(() => location.pathname === path, 6000)) return 'failed';
+    } else {
+      songPlayButtons().forEach(b => { delete b.dataset.ssStale; });
+    }
+
+    let btn = await waitFor(() => songPlayButtons().find(b => !b.dataset.ssStale), 6000);
+    if (gen !== playGen) return 'stale';
+    if (!btn) btn = songPlayButtons()[0];   // DOM node may have been reused across pages
+    if (!btn) return 'failed';
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const prevSrc = getPlayer()?.currentSrc || '';
+      btn.click();
+      if (await waitFor(() => isPlayingNewSource(prevSrc) || gen !== playGen, 10000, 200)) {
+        return gen !== playGen ? 'stale' : 'playing';
+      }
+      if (gen !== playGen) return 'stale';
+      const p = getPlayer();
+      // Source loaded but not playing → autoplay policy blocked the start.
+      if (p && p.currentSrc && p.currentSrc !== prevSrc && p.paused) return 'blocked';
+      btn = songPlayButtons()[0] || btn;
+    }
+    return 'failed';
+  }
+
+  async function playSong(song, index, total) {
     navigating = false;
     const gen = ++playGen;   // every new song gets a unique generation
     currentSong = song;
+    currentIndex = index;
+    currentTotal = total;
+    awaitingGesture = false;
+    starting = true;
     setSpinner(true);
     setCurrentSongUI(song, index, total);
 
-    audio.src = song.audio_url;
-    audio.load();
-    audio.play()
-      .then(() => {
-        if (gen !== playGen) return;   // a newer song already took over
-        setSpinner(false); startProgressTracking(); pauseSunoNativePlayer();
-      })
-      .catch(() => {
-        if (gen !== playGen) return;   // skip aborted this play() — not a real failure
-        setSpinner(false);
-        const alt = song.audio_url.replace('cdn1.suno.ai', 'cdn2.suno.ai');
-        if (audio.src !== alt) {
-          audio.src = alt;
-          audio.play()
-            .then(() => { if (gen === playGen) { startProgressTracking(); pauseSunoNativePlayer(); } })
-            .catch(() => {
-              if (gen !== playGen) return;
-              console.warn('[SunoShuffle] Skipping unplayable song'); advanceQueue();
-            });
-        } else {
-          advanceQueue();
-        }
-      });
+    let result;
+    try {
+      result = await startOnSunoPlayer(song, gen);
+    } catch (e) {
+      console.warn('[SunoShuffle]', e);
+      result = 'failed';
+    }
+    if (gen !== playGen || result === 'stale') return;   // a newer song already took over
+    starting = false;
+    setSpinner(false);
+
+    if (result === 'playing') {
+      const p = getPlayer();
+      if (p && savedVolume != null) p.volume = savedVolume;
+      startProgressTracking();
+    } else if (result === 'blocked') {
+      awaitingGesture = true;
+      if (playPauseBtn) playPauseBtn.textContent = '▶';
+      if (titleEl) titleEl.textContent = song.title + ' — press ▶ to start';
+    } else if (result === 'failed') {
+      // Don't silently burn through the whole queue if Suno's page structure changed again.
+      consecutiveFailures++;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        consecutiveFailures = 0;
+        awaitingGesture = true;
+        if (playPauseBtn) playPauseBtn.textContent = '▶';
+        if (titleEl) titleEl.textContent = 'Could not start Suno’s player — press ▶ to retry';
+        return;
+      }
+      console.warn('[SunoShuffle] Could not start song on Suno player, skipping:', song.id);
+      advanceQueue();
+      return;
+    }
+    if (result === 'playing') consecutiveFailures = 0;
   }
+
+  const MAX_CONSECUTIVE_FAILURES = 3;
+  let consecutiveFailures = 0;
 
   function advanceQueue() {
     if (!shuffleActive) return;
@@ -462,10 +585,21 @@
       });
       return;
     }
-    if (audio.paused) {
-      audio.play(); if (playPauseBtn) playPauseBtn.textContent = '\u23f8'; startProgressTracking();
+    if (awaitingGesture && currentSong) {
+      // This click is a real user gesture, so Suno's player is now allowed to start.
+      playSong(currentSong, currentIndex, currentTotal);
+      return;
+    }
+    const p = getPlayer();
+    if (!p) return;
+    if (p.paused) {
+      p.play().catch(() => {});
+      if (playPauseBtn) playPauseBtn.textContent = '\u23f8';
+      startProgressTracking();
     } else {
-      audio.pause(); if (playPauseBtn) playPauseBtn.textContent = '\u25b6'; stopProgressTracking();
+      p.pause();
+      if (playPauseBtn) playPauseBtn.textContent = '\u25b6';
+      stopProgressTracking();
     }
   }
 
@@ -479,8 +613,7 @@
   function skipSong() {
     if (!shuffleActive || navigating) return;
     navigating = true;
-    playGen++;              // invalidate any pending .catch() from the paused song
-    audio.pause();
+    playGen++;              // invalidate any in-flight start of the previous song
     stopProgressTracking();
     advanceQueue();
   }
@@ -489,7 +622,6 @@
     if (!shuffleActive || navigating) return;
     navigating = true;
     playGen++;
-    audio.pause();
     stopProgressTracking();
     chromeSafe(() => {
       chrome.runtime.sendMessage({ type: 'STEP_BACK' }, (resp) => {
@@ -506,8 +638,8 @@
   // The queue stays intact; pressing play resumes from the start of the song.
   function stopCurrentSong() {
     if (!overlay) return;
-    audio.pause();
-    audio.currentTime = 0;
+    const p = getPlayer();
+    if (p) { p.pause(); p.currentTime = 0; }
     stopProgressTracking();
     if (progressFill) progressFill.style.width = '0%';
     if (timeEl)       timeEl.textContent = '0:00';
@@ -517,8 +649,13 @@
   function stopShuffle() {
     shuffleActive = false;
     navigating = false;
-    audio.pause(); audio.src = '';
+    starting = false;
+    awaitingGesture = false;
+    playGen++;
+    const p = getPlayer();
+    if (p && !p.paused) p.pause();
     stopProgressTracking();
+    setSpinner(false);
     currentSong = null;
     if (overlay) {
       setOverlayStatus('Shuffle stopped');
@@ -574,16 +711,36 @@
 
   // ─── Audio events ──────────────────────────────────────────────────────────
 
-  audio.addEventListener('ended',  () => { if (shuffleActive && !navigating) advanceQueue(); });
-  audio.addEventListener('pause',  () => { if (playPauseBtn) playPauseBtn.textContent = '\u25b6'; });
-  audio.addEventListener('play',   () => { if (playPauseBtn) playPauseBtn.textContent = '\u23f8'; });
-  audio.addEventListener('error',  () => {
+  // Media events don't bubble, but they do pass through the capture phase \u2014 listening on
+  // document keeps working even if Suno replaces its <audio> element.
+  function onPlayerEvent(type, handler) {
+    document.addEventListener(type, (e) => {
+      if (e.target && e.target.id === PLAYER_ID) handler(e.target);
+    }, true);
+  }
+
+  onPlayerEvent('ended', () => {
+    if (shuffleActive && !navigating && !starting && currentSong) advanceQueue();
+  });
+  onPlayerEvent('pause', () => {
+    if (!shuffleActive || starting) return;
+    if (playPauseBtn) playPauseBtn.textContent = '\u25b6';
+  });
+  onPlayerEvent('play', () => {
     if (!shuffleActive) return;
+    if (playPauseBtn) playPauseBtn.textContent = '\u23f8';
+    startProgressTracking();
+  });
+  onPlayerEvent('volumechange', (p) => {
+    if (volumeSlider && !starting) volumeSlider.value = Math.round(p.volume * 100);
+  });
+  onPlayerEvent('error', () => {
+    if (!shuffleActive || starting) return;
     const gen = playGen;
-    console.warn('[SunoShuffle] Audio error, skipping in 1s\u2026');
+    console.warn('[SunoShuffle] Suno player error, skipping in 1s\u2026');
     setTimeout(() => {
       // Ignore if a newer song already started (gen changed) or a skip is in-flight
-      if (gen !== playGen || !shuffleActive || navigating) return;
+      if (gen !== playGen || !shuffleActive || navigating || starting) return;
       advanceQueue();
     }, 1000);
   });

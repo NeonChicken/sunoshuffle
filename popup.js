@@ -1,5 +1,7 @@
 // popup.js
 
+const LIKED_URL = 'https://suno.com/playlist/liked';
+
 // DEV tag for unpacked installs (never shown in the Web Store build)
 chrome.management.getSelf().then((self) => {
   if (self.installType !== 'development') return;
@@ -9,221 +11,180 @@ chrome.management.getSelf().then((self) => {
   document.getElementById('app-name').appendChild(tag);
 }).catch(() => {});
 
-const btnStart      = document.getElementById('btn-start');
-const btnResume     = document.getElementById('btn-resume');
-const btnReshuffle  = document.getElementById('btn-reshuffle');
-const btnCancelScan = document.getElementById('btn-cancel-scan');
-const btnResetPos   = document.getElementById('btn-reset-pos');
-const btnClear      = document.getElementById('btn-clear');
-const msgEl        = document.getElementById('message');
-const nowTitle     = document.getElementById('now-playing-title');
-const queueInfo    = document.getElementById('queue-info');
+const $ = (id) => document.getElementById(id);
+const btnStart      = $('btn-start');
+const btnResume     = $('btn-resume');
+const btnCancelScan = $('btn-cancel-scan');
+const btnResetPos   = $('btn-reset-pos');
+const btnClear      = $('btn-clear');
+const msgEl         = $('message');
+
+let sunoTab = null;   // the Suno tab we act on (active one preferred)
 
 function showMsg(text, type = '') {
   msgEl.textContent = text;
   msgEl.className = type;
 }
 
-function clearMsg() {
-  msgEl.textContent = '';
-  msgEl.className = '';
+function clearMsg() { showMsg(''); }
+
+function setBusy(on) {
+  btnStart.disabled = on;
+  btnResume.disabled = on;
+  btnClear.disabled = on;
 }
 
-function setLoading(on) {
-  btnStart.disabled     = on;
-  btnResume.disabled    = on;
-  btnReshuffle.disabled = on;
-  btnClear.disabled     = on;
-}
-
-function setScanningMode(on, tab) {
-  btnCancelScan.style.display = on ? 'block' : 'none';
-  if (on) {
-    btnCancelScan.onclick = () => sendToContent(tab, { type: 'CANCEL_SCAN' });
-  }
+function pageName(tab) {
+  if (!tab) return null;
+  const t = (tab.title || '')
+    .replace(/\s*\|\s*Suno\s*$/i, '')
+    .replace(/\s+by\s+@\S+$/i, '')
+    .trim();
+  return t || new URL(tab.url).pathname;
 }
 
 function updateStatusUI(status) {
-  if (status && status.currentSong) {
-    nowTitle.textContent = status.currentSong.title;
-    const played  = status.queueIndex;
-    const total   = status.queueLength;
-    const cycle   = status.queueCycle || 0;
-    queueInfo.textContent = `Queue: ${played} / ${total}  ·  Cycle: ${cycle + 1}`;
-    btnResume.disabled    = false;
-    btnReshuffle.disabled = false;
-  } else if (status && status.queueLength > 0) {
-    nowTitle.textContent  = '—';
-    queueInfo.textContent = `Queue: ${status.queueIndex} / ${status.queueLength}  ·  Cycle: ${(status.queueCycle || 0) + 1}`;
-    btnResume.disabled    = false;
-    btnReshuffle.disabled = false;
+  const has = !!(status && status.currentSong);
+  $('now-label').textContent = has ? (status.sourceName ? `Shuffling ${status.sourceName}` : 'Last played') : 'Nothing queued yet';
+  $('now-title').textContent = has ? status.currentSong.title : '';
+  $('now-meta').textContent = has
+    ? `${Math.max(1, status.queueIndex)} of ${status.queueLength}  ·  cycle ${(status.queueCycle || 0) + 1}`
+    : 'Open a playlist and press Shuffle';
+  const art = $('now-art');
+  if (has && status.currentSong.image_url) {
+    art.src = status.currentSong.image_url;
+    art.hidden = false;
   } else {
-    nowTitle.textContent  = '—';
-    queueInfo.textContent = 'Queue: — / —  ·  Cycle: —';
-    btnResume.disabled    = true;
-    btnReshuffle.disabled = true;
+    art.hidden = true;
   }
+  btnResume.hidden = !has;
 }
 
-// Get the active suno.com tab, preferring the focused/active one
-async function getSunoTab() {
-  const active = await chrome.tabs.query({ active: true, url: 'https://suno.com/*' });
-  if (active.length > 0) return active[0];
+async function findSunoTab() {
+  const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (active && /^https:\/\/suno\.com\//.test(active.url || '')) return active;
   const tabs = await chrome.tabs.query({ url: 'https://suno.com/*' });
-  return tabs.length > 0 ? tabs[0] : null;
+  return tabs[0] || null;
 }
 
-async function ensureSunoTab() {
-  let tab = await getSunoTab();
-  if (!tab) {
-    // Open suno.com in a new tab
-    tab = await chrome.tabs.create({ url: 'https://suno.com/library' });
-    // Wait briefly for content script to load
-    await new Promise(r => setTimeout(r, 2000));
+function updateTargetUI() {
+  if (sunoTab) {
+    $('target-label').hidden = false;
+    $('target-label').textContent = 'Page';
+    $('target-name').textContent = pageName(sunoTab);
+    btnStart.textContent = 'Shuffle this page';
+  } else {
+    $('target-label').hidden = true;
+    $('target-name').textContent = 'Suno isn’t open in this window.';
+    btnStart.textContent = 'Open your Liked songs';
   }
-  return tab;
 }
 
-async function sendToContent(tab, message) {
+function sendToContent(tab, message) {
   return new Promise((resolve) => {
     chrome.tabs.sendMessage(tab.id, message, (response) => {
-      if (chrome.runtime.lastError) {
-        resolve(null);
-      } else {
-        resolve(response);
-      }
+      resolve(chrome.runtime.lastError ? undefined : response);
     });
   });
 }
 
-// ── Start Shuffle ─────────────────────────────────────────────────────────────
+const UNREACHABLE = 'Can’t reach the Suno tab. Refresh it (F5) and try again.';
+
+async function focusTab(tab) {
+  // Switching tabs closes this popup, so only do it when the Suno tab isn't already in front.
+  if (tab.active) return;
+  await chrome.tabs.update(tab.id, { active: true });
+  if (tab.windowId != null) await chrome.windows.update(tab.windowId, { focused: true });
+}
+
+// ── Shuffle this page ─────────────────────────────────────────────────────────
 btnStart.addEventListener('click', async () => {
   clearMsg();
-  setLoading(true);
-  showMsg('Opening Suno and loading songs…');
+
+  if (!sunoTab) {
+    await chrome.tabs.create({ url: LIKED_URL });
+    window.close();
+    return;
+  }
+
+  setBusy(true);
+  btnCancelScan.hidden = false;
+  btnCancelScan.onclick = () => sendToContent(sunoTab, { type: 'CANCEL_SCAN' });
+  showMsg('Scanning the page…');
 
   try {
-    const tab = await ensureSunoTab();
-    await chrome.tabs.update(tab.id, { active: true });
-
-    // Small delay to ensure content script is ready after potential navigation
-    await new Promise(r => setTimeout(r, 500));
-
-    setScanningMode(true, tab);
-    const res = await sendToContent(tab, { type: 'START_SHUFFLE' });
-    setScanningMode(false, null);
-
-    if (!res || !res.success) {
-      showMsg(res?.error || 'Failed to start shuffle. Try reloading suno.com.', 'error');
+    await focusTab(sunoTab);
+    const res = await sendToContent(sunoTab, { type: 'START_SHUFFLE' });
+    if (res === undefined) {
+      showMsg(UNREACHABLE, 'error');
+    } else if (!res || !res.success) {
+      showMsg(res?.error || 'Couldn’t start the shuffle.', 'error');
     } else {
-      showMsg(`Loaded ${res.count} songs (${res.total} total). Shuffling!`, 'success');
-      // Refresh status
-      const status = await chrome.runtime.sendMessage({ type: 'GET_STATUS' });
-      updateStatusUI(status);
+      showMsg(`Shuffling ${res.count} songs`, 'success');
+      updateStatusUI(await chrome.runtime.sendMessage({ type: 'GET_STATUS' }));
     }
   } catch (e) {
     showMsg('Error: ' + e.message, 'error');
   } finally {
-    setLoading(false);
+    btnCancelScan.hidden = true;
+    setBusy(false);
   }
 });
 
 // ── Resume ────────────────────────────────────────────────────────────────────
 btnResume.addEventListener('click', async () => {
   clearMsg();
-  setLoading(true);
-  showMsg('Resuming…');
-
+  if (!sunoTab) {
+    await chrome.tabs.create({ url: LIKED_URL });
+    window.close();
+    return;
+  }
+  setBusy(true);
   try {
-    const tab = await ensureSunoTab();
-    await chrome.tabs.update(tab.id, { active: true });
-    await new Promise(r => setTimeout(r, 400));
-
-    const res = await sendToContent(tab, { type: 'RESUME_SHUFFLE' });
-    if (res && res.success) {
-      showMsg('Resumed!', 'success');
-    } else {
-      showMsg('Could not resume. Try Start Shuffle.', 'error');
-    }
+    await focusTab(sunoTab);
+    const res = await sendToContent(sunoTab, { type: 'RESUME_SHUFFLE' });
+    if (res === undefined) showMsg(UNREACHABLE, 'error');
+    else if (res && res.success) window.close();
+    else showMsg('Couldn’t resume. Try Shuffle this page.', 'error');
   } catch (e) {
     showMsg('Error: ' + e.message, 'error');
   } finally {
-    setLoading(false);
+    setBusy(false);
   }
 });
 
-// ── Re-shuffle ────────────────────────────────────────────────────────────────
-btnReshuffle.addEventListener('click', async () => {
-  clearMsg();
-  setLoading(true);
-  showMsg('Re-shuffling remaining songs…');
-
-  try {
-    // Delegate entirely to the content script so FETCH_AND_SHUFFLE runs with tab context
-    const tab = await ensureSunoTab();
-    await chrome.tabs.update(tab.id, { active: true });
-    await new Promise(r => setTimeout(r, 400));
-
-    const res = await sendToContent(tab, { type: 'START_SHUFFLE' });
-    if (!res || !res.success) {
-      showMsg(res?.error || 'Re-shuffle failed.', 'error');
-    } else {
-      showMsg(`Re-shuffled ${res.count} songs.`, 'success');
-      const status = await chrome.runtime.sendMessage({ type: 'GET_STATUS' });
-      updateStatusUI(status);
-    }
-  } catch (e) {
-    showMsg('Error: ' + e.message, 'error');
-  } finally {
-    setLoading(false);
-  }
-});
-
-// ── Reset Player Position ─────────────────────────────────────────────────────
+// ── Reset player position ─────────────────────────────────────────────────────
 btnResetPos.addEventListener('click', async () => {
   clearMsg();
-  try {
-    await chrome.storage.local.remove('overlayPos');
-    const tab = await getSunoTab();
-    if (tab) {
-      await sendToContent(tab, { type: 'RESET_OVERLAY_POS' });
-    }
-    showMsg('Player position reset.', 'success');
-  } catch (e) {
-    showMsg('Error: ' + e.message, 'error');
-  }
+  await chrome.storage.local.remove('overlayPos');
+  if (sunoTab) await sendToContent(sunoTab, { type: 'RESET_OVERLAY_POS' });
+  showMsg('Player moved back to the corner.', 'success');
 });
 
-// ── Clear ─────────────────────────────────────────────────────────────────────
+// ── Clear history ─────────────────────────────────────────────────────────────
 btnClear.addEventListener('click', async () => {
-  if (!confirm('Clear queue and all played history? This will reset everything.')) return;
-
+  if (!confirm('Clear the queue and play history? The next shuffle starts fresh.')) return;
   clearMsg();
-  setLoading(true);
-
+  setBusy(true);
   try {
-    // Stop playback in content script if active
-    const tab = await getSunoTab();
-    if (tab) {
-      await sendToContent(tab, { type: 'CONTENT_STOP' });
-    }
-
+    if (sunoTab) await sendToContent(sunoTab, { type: 'CONTENT_STOP' });
     await chrome.runtime.sendMessage({ type: 'CLEAR_QUEUE' });
     showMsg('Queue and history cleared.', 'success');
     updateStatusUI(null);
   } catch (e) {
     showMsg('Error: ' + e.message, 'error');
   } finally {
-    setLoading(false);
+    setBusy(false);
   }
 });
 
-// ── Init: load current status ─────────────────────────────────────────────────
+// ── Init ──────────────────────────────────────────────────────────────────────
 (async () => {
+  sunoTab = await findSunoTab();
+  updateTargetUI();
   try {
-    const status = await chrome.runtime.sendMessage({ type: 'GET_STATUS' });
-    updateStatusUI(status);
+    updateStatusUI(await chrome.runtime.sendMessage({ type: 'GET_STATUS' }));
   } catch {
-    // Background not ready yet
+    updateStatusUI(null);
   }
 })();

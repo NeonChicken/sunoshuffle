@@ -1,4 +1,10 @@
-// content.js — Overlay player + DOM scraper injected into suno.com
+// content.js — Shuffle player overlay + song-list scanner, injected into suno.com.
+//
+// Playback goes through Suno's own player: Suno no longer serves plain MP3s (direct CDN
+// URLs return 403 and the new media files only play through Suno's player). We press the
+// song's row "Play <title>" button on the list the shuffle came from, then observe Suno's
+// <audio id="active-audio-play"> for progress and end-of-track. While a shuffle runs,
+// Suno's own bottom player bar is hidden and this overlay is the player.
 
 (function () {
   'use strict';
@@ -23,41 +29,82 @@
     }
   }
 
-  // ─── Suno's native player ──────────────────────────────────────────────────
-  // Suno no longer serves plain MP3s (cdn1/cdn2 URLs return 403 and the new media files
-  // are only playable through Suno's own player). So instead of running our own <audio>,
-  // we drive Suno's player: navigate to the song page, press its Play button, and observe
-  // this element for progress / end-of-track.
+  function log(...args) { console.info('[SunoShuffle]', ...args); }
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function storageSet(obj) {
+    return new Promise((resolve) => {
+      try {
+        if (!chrome.runtime?.id) return resolve();
+        chrome.storage.local.set(obj, () => resolve());
+      } catch (e) { resolve(); }
+    });
+  }
+
+  function sendMessage(msg) {
+    return new Promise((resolve) => {
+      try {
+        if (!chrome.runtime?.id) return resolve(null);
+        chrome.runtime.sendMessage(msg, (res) => resolve(chrome.runtime.lastError ? null : res));
+      } catch (e) { resolve(null); }
+    });
+  }
+
+  // ─── Suno's player ─────────────────────────────────────────────────────────
   const PLAYER_ID = 'active-audio-play';
   function getPlayer() { return document.getElementById(PLAYER_ID); }
 
-  let savedVolume = null;        // user's overlay volume (0..1), applied to Suno's player
-  let currentIndex = 0;
-  let currentTotal = 0;
-  let starting = false;          // true while we are switching Suno's player to a new song
-  let sourcePath = null;         // the playlist/library page the shuffle was started from
-  let loadedSongId = null;       // song we last loaded into Suno's player
-  let suppressForeignPlay = false; // pause anything Suno auto-plays until we press Play ourselves
-  const AUTOPLAY_KEY = 'ssAutoplay'; // survives a full page reload during a song switch
-  const AUTOPLAY_TTL = 45000;
+  /** Song id shown in Suno's player bar (still in the DOM while we hide the bar). */
+  function getPlaybarSongId() {
+    const a = document.querySelector('[data-playbar="true"] a[href*="/song/"]');
+    const m = a && (a.getAttribute('href') || '').match(SONG_HREF_RE);
+    return m ? m[1].toLowerCase() : null;
+  }
 
-  function log(...args) { console.info('[SunoShuffle]', ...args); }
-  let awaitingGesture = false;   // autoplay was blocked; next ▶ click retries currentSong
+  // ─── State ─────────────────────────────────────────────────────────────────
+  const AUTOPLAY_KEY = 'ssAutoplay';   // survives a full page reload during a song switch
+  const AUTOPLAY_TTL = 45000;
+  const MAX_CONSECUTIVE_FAILURES = 3;
 
   let shuffleActive = false;
-  let currentSong   = null;
-  let progressInterval = null;
-  let overlayMinimized = false;
+  let currentSong = null;
+  let currentIndex = 0;
+  let currentTotal = 0;
+  let sourcePath = null;          // the playlist/library page the shuffle was started from
+  let sourceName = null;          // its title, e.g. "FAVS"
+  let loadedSongId = null;        // song we last loaded into Suno's player
+  let ourSrc = null;              // player src of the song we started
+  let starting = false;           // switching Suno's player to a new song
+  let suppressForeignPlay = false;// pause anything Suno auto-plays until we press Play ourselves
+  let awaitingGesture = false;    // autoplay was blocked; next ▶ retries currentSong
+  let externalTakeover = false;   // user started something else in Suno
+  let pendingResume = false;      // restored after a page load, paused
+  let consecutiveFailures = 0;
   let scanCancelled = false;
-  let volumeSlider  = null;
-  let pendingResume = false;
+  let savedVolume = null;
+  let hideSunoBar = true;
+  let progressInterval = null;
 
-  // ─── DOM References (overlay) ──────────────────────────────────────────────
-  let overlay, titleEl, counterEl, imgEl, progressFill, timeEl, playPauseBtn, spinnerEl;
+  // navigating blocks new skip/prev clicks while one is in-flight; playGen is bumped on
+  // every skip/prev/playSong so stale async continuations are ignored.
+  let navigating = false;
+  let playGen = 0;
+
+  function setActive(on) {
+    shuffleActive = on;
+    applyBarVisibility();
+    window.postMessage({ __ssBridge: 'state', active: on }, location.origin);
+  }
+
+  function applyBarVisibility() {
+    document.documentElement.classList.toggle(
+      'ss-hide-playbar', shuffleActive && hideSunoBar && !externalTakeover);
+  }
 
   // ─── DOM Scraping ──────────────────────────────────────────────────────────
 
   const SONG_HREF_RE = /\/song\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+  const ROW_PLAY_SEL = '[role="button"][aria-label^="Play "]';
   // Song ids whose title came from the song link text itself (most reliable source).
   const strongTitleIds = new Set();
 
@@ -70,13 +117,11 @@
       accumulator.set(id, { id, title, image_url: extractImage(el, id) });
     });
 
-    // Strategy 2: anchor links pointing to /song/{uuid}.
-    // Current Suno markup: <a href="/song/{id}">Title</a> inside an unattributed row div.
-    // (Thumbnail UUIDs are NOT clip ids anymore, so images are never used to discover songs.)
-    // Only links inside a list row (one with a "Play <title>" cover) count, so the
-    // miniplayer / now-playing panel's link to whatever is playing doesn't sneak in.
-    // If Suno ever drops that row button, fall back to accepting every song link.
-    const anyRows = !!document.querySelector('[role="button"][aria-label^="Play "]');
+    // Strategy 2: <a href="/song/{id}">Title</a> inside a list row.
+    // Only links inside a row with a "Play <title>" cover count, so the player bar /
+    // now-playing panel links to whatever is playing don't sneak in. If Suno ever drops
+    // that row button, fall back to accepting every song link.
+    const anyRows = !!document.querySelector(ROW_PLAY_SEL);
     document.querySelectorAll('a[href*="/song/"]').forEach(a => {
       if (a.closest('#ss-overlay')) return;
       const m = (a.getAttribute('href') || '').match(SONG_HREF_RE);
@@ -84,7 +129,7 @@
       const id = m[1].toLowerCase();
 
       const container = findSongRow(a, id);
-      if (anyRows && !container.querySelector('[role="button"][aria-label^="Play "]')) return;
+      if (anyRows && !container.querySelector(ROW_PLAY_SEL)) return;
 
       const linkText = a.textContent.trim();
       const hasLinkTitle = linkText.length >= 1 && linkText.length <= 150 && !isDurationString(linkText);
@@ -95,6 +140,20 @@
       if (hasLinkTitle) strongTitleIds.add(id);
       accumulator.set(id, { id, title, image_url: existing?.image_url || extractImage(container, id) });
     });
+  }
+
+  /** Number of distinct songs whose rows are currently rendered. */
+  function renderedRowCount() {
+    const ids = new Set();
+    document.querySelectorAll(ROW_PLAY_SEL).forEach(b => {
+      let row = b;
+      for (let i = 0; i < 8 && row; i++, row = row.parentElement) {
+        const a = row.querySelector && row.querySelector('a[href*="/song/"]');
+        const m = a && (a.getAttribute('href') || '').match(SONG_HREF_RE);
+        if (m) { ids.add(m[1].toLowerCase()); break; }
+      }
+    });
+    return ids.size;
   }
 
   /** Walk up from a song link to the largest ancestor that only references this one song. */
@@ -114,36 +173,26 @@
 
   function extractTitle(container) {
     if (!container) return null;
-
-    // Named test-id first
     const byTestId = container.querySelector('[data-testid*="title"], [data-testid*="name"]');
     if (byTestId) {
       const t = byTestId.textContent.trim();
       if (t && !isDurationString(t)) return t;
     }
-
-    // Collect all leaf-text candidates, rank them
     const candidates = [];
     for (const el of container.querySelectorAll('p, span, div, h1, h2, h3, a')) {
       if (el.childElementCount > 0) continue;
       const text = el.textContent.trim();
       if (!text || text.length < 2 || text.length > 150) continue;
-      if (isDurationString(text)) continue;   // skip "2:34", "1:23:45"
-      if (/^\d+$/.test(text)) continue;       // skip pure numbers
+      if (isDurationString(text)) continue;
+      if (/^\d+$/.test(text)) continue;
       candidates.push(text);
     }
-
     if (candidates.length === 0) return null;
-
-    // Song titles are short; descriptions are long.
-    // Cap at 80 chars, then take the first remaining candidate in DOM order
-    // (title elements appear before description elements in the markup).
     const titled = candidates.filter(t => t.length <= 80);
     return (titled.length > 0 ? titled : candidates)[0];
   }
 
   function isDurationString(text) {
-    // Matches "2:34", "02:34", "1:23:45"
     return /^\d{1,2}:\d{2}(:\d{2})?$/.test(text);
   }
 
@@ -163,16 +212,11 @@
       const m = (el.getAttribute('aria-label') || '').match(/^(\d[\d,.]*)\s+songs?$/i);
       if (m) counts.push(parseInt(m[1].replace(/[,.]/g, ''), 10));
     }
-    // Only trust it when there's exactly one such list — otherwise keep scrolling.
     return counts.length === 1 && counts[0] > 0 ? counts[0] : null;
   }
 
-  /**
-   * Find the element that actually scrolls the song list.
-   * Suno renders the list inside a scrollable div, not the window.
-   */
+  /** The element that scrolls the song list (Suno uses an inner div, not the window). */
   function findScrollContainer() {
-    // Walk every element and return the tallest one with overflow scroll/auto
     let best = null;
     let bestScrollable = 0;
     for (const el of document.querySelectorAll('*')) {
@@ -187,238 +231,476 @@
     return best;
   }
 
+  /** Some lists paginate with a button instead of infinite scroll. */
+  function clickLoadMore() {
+    const btn = [...document.querySelectorAll('button, [role="button"]')].find(b =>
+      !b.closest('#ss-overlay') && !b.disabled &&
+      /^(load|show|see)\s+more(\s+songs)?$/i.test(b.textContent.trim()));
+    if (btn) { log('clicking', JSON.stringify(btn.textContent.trim())); btn.click(); }
+  }
+
+  function pageTitleName() {
+    return (document.title || '')
+      .replace(/\s*\|\s*Suno\s*$/i, '')
+      .replace(/\s+by\s+@\S+$/i, '')
+      .trim() || null;
+  }
+
   /**
-   * Scroll the page (or its inner scrollable container) to load all lazily-rendered
-   * songs, accumulating them into a Map even as virtual scroll removes earlier nodes.
+   * Scroll through the list and collect every song. Long lists load more songs as you
+   * reach the bottom, so at the bottom we wait (and nudge the scroll so the loader fires)
+   * until nothing new arrives. Starts from the current position, so a list the user has
+   * already scrolled to the bottom is picked up immediately.
    */
   async function loadAllSongsFromCurrentPage() {
     scanCancelled = false;
     strongTitleIds.clear();
     const songs = new Map();
-    let lastSize = -1;
-    let staleRounds = 0;
-    const TICK = 800;           // ms between scroll steps
-    const MAX_STALE = 12;       // ~10s without new songs while still able to scroll
-    const MAX_STALE_BOTTOM = 4; // ~3s at the very bottom (time for lazy loading to kick in)
-    const STEP = 600;           // scroll 600px per tick — small enough to trigger observers
 
-    setOverlayStatus('Scanning… (0 songs)');
-    setScanningUI(true);
+    const TICK = 350;              // ms between scroll steps while moving
+    const BOTTOM_TICK = 500;
+    const GRACE_DONE = 2500;       // at bottom and the list's "N songs" count is reached
+    const GRACE_UNKNOWN = 8000;    // at bottom, count unknown
+    const GRACE_MISSING = 20000;   // at bottom, but the page says more songs exist
+    const HARD_LIMIT = 15 * 60 * 1000;
 
-    // Find scroll container once (it may not exist yet, retry briefly)
+    ui.showScan(songs.size, 'scanning');
+
     let container = null;
     for (let attempt = 0; attempt < 5 && !container; attempt++) {
       container = findScrollContainer();
-      if (!container) await sleep(600);
+      if (!container) await sleep(400);
+    }
+    const scroller = container || document.scrollingElement;
+    const pos = () => scroller.scrollTop;
+    const step = () => Math.max(400, Math.round(scroller.clientHeight * 0.85));
+    const startTop = pos();
+
+    function scrollBy(dy) {
+      const before = pos();
+      scroller.scrollTop = before + dy;
+      return pos() !== before;
     }
 
-    /** Scroll one step; returns false when nothing could scroll any further. */
-    function scrollDown() {
-      const before = (container ? container.scrollTop : 0) + window.scrollY;
-      if (container) container.scrollTop += STEP;
-      window.scrollBy({ top: STEP, behavior: 'instant' });
-      return (container ? container.scrollTop : 0) + window.scrollY !== before;
-    }
-
-    function scrollToTop() {
-      if (container) container.scrollTop = 0;
-      window.scrollTo({ top: 0, behavior: 'instant' });
-    }
-
-    while (!scanCancelled) {
+    function collect() {
+      const before = songs.size;
       scrapeVisibleSongs(songs);
+      if (songs.size !== before) ui.showScan(songs.size, 'scanning');
+      return songs.size > before;
+    }
 
-      if (songs.size > lastSize) {
-        staleRounds = 0;
-        lastSize = songs.size;
-        setOverlayStatus(`Scanning… (${songs.size} songs)`);
-      } else {
-        staleRounds++;
+    const t0 = Date.now();
+    let lastGrowth = Date.now();
+    let bottomSince = null;
+    let lastNudge = 0;
+
+    collect();
+    while (!scanCancelled && Date.now() - t0 < HARD_LIMIT) {
+      if (collect()) lastGrowth = Date.now();
+
+      if (scrollBy(step())) {
+        bottomSince = null;
+        await sleep(TICK);
+        continue;
       }
 
-      // Playlists label their list "<N> songs" — stop as soon as we have them all.
+      // At the bottom: give lazy loading time to append more songs.
+      const now = Date.now();
+      if (bottomSince === null) bottomSince = now;
       const expected = expectedSongCount();
-      if (expected && songs.size >= expected) break;
+      const grace = !expected ? GRACE_UNKNOWN : (songs.size >= expected ? GRACE_DONE : GRACE_MISSING);
+      if (now - Math.max(bottomSince, lastGrowth) >= grace) break;
 
-      const moved = scrollDown();
-      if (staleRounds >= (moved ? MAX_STALE : MAX_STALE_BOTTOM)) break;
-      await sleep(TICK);
+      ui.showScan(songs.size, 'waiting', expected);
+      if (now - lastNudge > 1500) {           // re-trigger the "load more" observer
+        lastNudge = now;
+        clickLoadMore();
+        scrollBy(-300);
+        await sleep(120);
+        scroller.scrollTop = scroller.scrollHeight;
+      }
+      await sleep(BOTTOM_TICK);
     }
 
-    setScanningUI(false);
-    scrollToTop();
+    // Virtualized lists drop rows that scrolled away: if we started mid-list and not every
+    // collected song is still rendered, sweep the part above our starting point too.
+    if (!scanCancelled && startTop > 50 && renderedRowCount() < songs.size) {
+      scroller.scrollTop = 0;
+      await sleep(TICK);
+      while (!scanCancelled && pos() < startTop) {
+        collect();
+        if (!scrollBy(step())) break;
+        await sleep(TICK);
+      }
+      collect();
+    }
+
+    scroller.scrollTop = 0;
     return Array.from(songs.values());
   }
 
-  // ─── Overlay ───────────────────────────────────────────────────────────────
+  // ─── Overlay UI ────────────────────────────────────────────────────────────
 
-  function createOverlay() {
-    if (document.getElementById('ss-overlay')) {
-      // Already exists — just re-cache references
-      overlay      = document.getElementById('ss-overlay');
-      titleEl      = document.getElementById('ss-song-title');
-      counterEl    = document.getElementById('ss-counter');
-      imgEl        = document.getElementById('ss-img');
-      progressFill = document.getElementById('ss-progress-fill');
-      timeEl       = document.getElementById('ss-time');
-      playPauseBtn = document.getElementById('ss-play-pause');
-      spinnerEl    = document.getElementById('ss-spinner');
-      volumeSlider = document.getElementById('ss-volume-slider');
-      return;
-    }
+  const ICON = {
+    logo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15l6 6"/><path d="M4 4l5 5"/></svg>',
+    play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.6v12.8a1 1 0 0 0 1.52.85l10.2-6.4a1 1 0 0 0 0-1.7L9.52 4.75A1 1 0 0 0 8 5.6z"/></svg>',
+    pause: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6.5" y="5" width="4" height="14" rx="1.2"/><rect x="13.5" y="5" width="4" height="14" rx="1.2"/></svg>',
+    prev: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="6" width="2.2" height="12" rx="1"/><path d="M18.5 6.9v10.2a.9.9 0 0 1-1.4.74L9.4 12.74a.9.9 0 0 1 0-1.48l7.7-5.1a.9.9 0 0 1 1.4.74z"/></svg>',
+    next: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="16.8" y="6" width="2.2" height="12" rx="1"/><path d="M5.5 6.9v10.2a.9.9 0 0 0 1.4.74l7.7-5.1a.9.9 0 0 0 0-1.48l-7.7-5.1a.9.9 0 0 0-1.4.74z"/></svg>',
+    vol: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5z" fill="currentColor"/><path d="M15.5 9a4.2 4.2 0 0 1 0 6"/><path d="M18 6.5a7.8 7.8 0 0 1 0 11"/></svg>',
+    mute: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5z" fill="currentColor"/><path d="m16 9.5 5 5"/><path d="m21 9.5-5 5"/></svg>',
+    bar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 15.5h18"/></svg>',
+    minimize: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 12h12"/></svg>',
+    expand: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 15 6-6 6 6"/></svg>',
+    close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M7 7l10 10M17 7 7 17"/></svg>',
+    info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>',
+  };
 
-    overlay = document.createElement('div');
-    overlay.id = 'ss-overlay';
-    overlay.innerHTML = [
-      '<div id="ss-header">',
-      '  <span id="ss-drag-handle" title="Drag to move">\u2847</span>',
-      '  <span id="ss-title-bar">Suno Shuffle</span>',
-      '  <button id="ss-minimize" title="Minimize">\u2212</button>',
-      '</div>',
-      '<div id="ss-body">',
-      '  <div id="ss-art-wrap">',
-      '    <img id="ss-img" src="" alt="" />',
-      '    <div id="ss-spinner"></div>',
-      '  </div>',
-      '  <div id="ss-info">',
-      '    <div id="ss-song-title">Not playing</div>',
-      '    <div id="ss-progress-wrap">',
-      '      <div id="ss-progress-bar"><div id="ss-progress-fill"></div></div>',
-      '      <span id="ss-time">0:00</span>',
-      '    </div>',
-      '    <div id="ss-counter">\u2014 / \u2014</div>',
-      '  </div>',
-      '  <div id="ss-controls">',
-      '    <button id="ss-prev"       title="Previous">\u23ee</button>',
-      '    <button id="ss-play-pause" title="Play / Pause">\u23f8</button>',
-      '    <button id="ss-skip"       title="Skip">\u23ed</button>',
-      '    <button id="ss-stop"       title="Stop shuffle">\u25a0</button>',
-      '  </div>',
-      '  <div id="ss-volume-row">',
-      '    <span id="ss-vol-icon">&#x1F50A;</span>',
-      '    <input id="ss-volume-slider" type="range" min="0" max="100" value="100" />',
-      '  </div>',
-      '  <button id="ss-cancel-scan">Stop scanning, play found songs</button>',
-      '</div>',
-    ].join('\n');
+  const ui = (() => {
+    let root = null;
+    const $ = (sel) => root && root.querySelector(sel);
+    let minimized = false;
+    let dragging = false;     // seeking via the progress bar
+    let waitingSince = null;  // scan: when we started waiting at the bottom of the list
 
-    document.body.appendChild(overlay);
+    function ensure() {
+      root = document.getElementById('ss-overlay');
+      if (root) return root;
 
-    titleEl      = overlay.querySelector('#ss-song-title');
-    counterEl    = overlay.querySelector('#ss-counter');
-    imgEl        = overlay.querySelector('#ss-img');
-    progressFill = overlay.querySelector('#ss-progress-fill');
-    timeEl       = overlay.querySelector('#ss-time');
-    playPauseBtn = overlay.querySelector('#ss-play-pause');
-    spinnerEl    = overlay.querySelector('#ss-spinner');
-    volumeSlider = overlay.querySelector('#ss-volume-slider');
+      root = document.createElement('div');
+      root.id = 'ss-overlay';
+      root.setAttribute('role', 'region');
+      root.setAttribute('aria-label', 'Suno Shuffle player');
+      root.innerHTML = `
+        <div id="ss-backdrop"></div>
+        <div id="ss-header">
+          <span id="ss-logo">${ICON.logo}</span>
+          <span id="ss-heading"><span id="ss-brand">Shuffle</span><span id="ss-source"></span></span>
+          <span id="ss-header-actions">
+            <button class="ss-icon-btn" id="ss-bar-toggle" type="button">${ICON.bar}</button>
+            <button class="ss-icon-btn" id="ss-minimize" type="button" title="Minimize">${ICON.minimize}</button>
+            <button class="ss-icon-btn" id="ss-close" type="button" title="Stop shuffle">${ICON.close}</button>
+          </span>
+        </div>
 
-    // Restore position / minimized state
-    chromeSafe(() => {
-      chrome.storage.local.get(['overlayPos', 'overlayMinimized', 'overlayVolume'], (data) => {
-        if (!data) return;
-        if (data.overlayPos) {
-          overlay.style.left   = data.overlayPos.x + 'px';
-          overlay.style.top    = data.overlayPos.y + 'px';
-          overlay.style.right  = 'auto';
-          overlay.style.bottom = 'auto';
-        }
-        if (data.overlayMinimized) {
-          overlayMinimized = true;
-          overlay.classList.add('ss-minimized');
-          overlay.querySelector('#ss-minimize').textContent = '+';
-        }
-        if (data.overlayVolume != null) {
-          savedVolume = data.overlayVolume;
-          if (volumeSlider) volumeSlider.value = Math.round(data.overlayVolume * 100);
-        }
+        <div id="ss-player">
+          <div id="ss-now">
+            <div id="ss-art-wrap"><img id="ss-img" alt="" /><div id="ss-spinner"></div></div>
+            <div id="ss-meta">
+              <div id="ss-song-title">Not playing</div>
+              <div id="ss-sub"></div>
+            </div>
+          </div>
+          <div id="ss-notice" hidden>
+            <span id="ss-notice-text"></span>
+            <button id="ss-notice-action" type="button"></button>
+          </div>
+          <div id="ss-progress">
+            <div id="ss-progress-bar" role="slider" aria-label="Seek" tabindex="0">
+              <div id="ss-progress-fill"></div><div id="ss-progress-thumb"></div>
+            </div>
+            <div id="ss-times"><span id="ss-time-cur">0:00</span><span id="ss-time-dur">0:00</span></div>
+          </div>
+          <div id="ss-controls">
+            <button class="ss-ctrl" id="ss-prev" type="button" title="Previous">${ICON.prev}</button>
+            <button id="ss-play-pause" type="button" title="Play / Pause">${ICON.play}</button>
+            <button class="ss-ctrl" id="ss-skip" type="button" title="Next">${ICON.next}</button>
+          </div>
+          <div id="ss-bottom">
+            <div id="ss-volume">
+              <button class="ss-icon-btn" id="ss-mute" type="button" title="Mute">${ICON.vol}</button>
+              <input id="ss-volume-slider" type="range" min="0" max="100" value="100" aria-label="Volume" />
+            </div>
+            <div id="ss-upnext" hidden><span class="ss-label">Next</span><span id="ss-upnext-title"></span></div>
+          </div>
+        </div>
+
+        <div id="ss-scan" hidden>
+          <div id="ss-scan-top">
+            <div id="ss-scan-ring"></div>
+            <div>
+              <div id="ss-scan-count">0</div>
+              <div id="ss-scan-label">songs found</div>
+            </div>
+          </div>
+          <div id="ss-scan-status"></div>
+          <div id="ss-scan-hint" hidden>${ICON.info}<span>Long list? Scroll to the bottom yourself first. Every loaded song is picked up at once.</span></div>
+          <button id="ss-cancel-scan" type="button">Stop scanning &amp; play</button>
+        </div>`;
+      document.body.appendChild(root);
+
+      $('#ss-minimize').addEventListener('click', toggleMinimize);
+      $('#ss-close').addEventListener('click', closeShuffle);
+      $('#ss-bar-toggle').addEventListener('click', toggleSunoBar);
+      $('#ss-play-pause').addEventListener('click', togglePlayPause);
+      $('#ss-skip').addEventListener('click', skipSong);
+      $('#ss-prev').addEventListener('click', prevSong);
+      $('#ss-cancel-scan').addEventListener('click', () => { scanCancelled = true; });
+      $('#ss-mute').addEventListener('click', toggleMute);
+      $('#ss-volume-slider').addEventListener('input', (e) => {
+        const v = e.target.value / 100;
+        savedVolume = v;
+        const p = getPlayer();
+        if (p) { p.volume = v; if (v > 0) p.muted = false; }
+        setVolume(v, false);
+        chromeSafe(() => chrome.storage.local.set({ overlayVolume: v }));
       });
-    });
+      setupSeek($('#ss-progress-bar'));
+      makeDraggable(root, $('#ss-header'));
 
-    overlay.querySelector('#ss-minimize').addEventListener('click', toggleMinimize);
-    overlay.querySelector('#ss-play-pause').addEventListener('click', togglePlayPause);
-    overlay.querySelector('#ss-skip').addEventListener('click', skipSong);
-    overlay.querySelector('#ss-stop').addEventListener('click', stopCurrentSong);
-    overlay.querySelector('#ss-prev').addEventListener('click', prevSong);
-    overlay.querySelector('#ss-progress-bar').addEventListener('click', seekTo);
-    overlay.querySelector('#ss-cancel-scan').addEventListener('click', () => { scanCancelled = true; });
-    overlay.querySelector('#ss-volume-slider').addEventListener('input', (e) => {
-      const v = e.target.value / 100;
-      savedVolume = v;
-      const p = getPlayer();
-      if (p) p.volume = v;
-      chromeSafe(() => chrome.storage.local.set({ overlayVolume: v }));
-    });
-
-    makeDraggable(overlay, overlay.querySelector('#ss-header'));
-
-    chromeSafe(() => {
-      chrome.runtime.sendMessage({ type: 'IS_DEV' }, (res) => {
-        if (chrome.runtime.lastError || !res?.dev) return;
-        const bar = overlay.querySelector('#ss-title-bar');
-        if (bar && !bar.querySelector('.ss-dev-tag')) {
+      chromeSafe(() => {
+        chrome.storage.local.get(['overlayPos', 'overlayMinimized', 'overlayVolume', 'hideSunoBar'], (data) => {
+          if (!data) return;
+          if (data.overlayPos) placeAt(data.overlayPos.x, data.overlayPos.y);
+          if (data.overlayMinimized) setMinimized(true, false);
+          if (data.overlayVolume != null) { savedVolume = data.overlayVolume; setVolume(savedVolume, false); }
+          if (data.hideSunoBar === false) hideSunoBar = false;
+          updateBarToggle();
+          applyBarVisibility();
+        });
+        chrome.runtime.sendMessage({ type: 'IS_DEV' }, (res) => {
+          if (chrome.runtime.lastError || !res?.dev || $('.ss-dev-tag')) return;
           const tag = document.createElement('span');
           tag.className = 'ss-dev-tag';
           tag.textContent = 'DEV';
-          bar.appendChild(tag);
-        }
+          $('#ss-heading').appendChild(tag);
+        });
       });
-    });
-  }
+      updateBarToggle();
+      return root;
+    }
+
+    function placeAt(x, y) {
+      // Keep it on screen even if the window got smaller since it was saved.
+      const maxX = Math.max(0, window.innerWidth - root.offsetWidth);
+      const maxY = Math.max(0, window.innerHeight - root.offsetHeight);
+      root.style.left = Math.min(Math.max(0, x), maxX) + 'px';
+      root.style.top = Math.min(Math.max(0, y), maxY) + 'px';
+      root.style.right = 'auto';
+      root.style.bottom = 'auto';
+    }
+
+    function resetPosition() {
+      if (!root) return;
+      root.style.left = ''; root.style.top = '';
+      root.style.right = ''; root.style.bottom = '';
+    }
+
+    function show() { ensure(); root.hidden = false; }
+    function hide() { if (root) root.hidden = true; }
+
+    function setMinimized(on, persist = true) {
+      ensure();
+      minimized = on;
+      root.classList.toggle('ss-minimized', on);
+      $('#ss-minimize').innerHTML = on ? ICON.expand : ICON.minimize;
+      $('#ss-minimize').title = on ? 'Expand' : 'Minimize';
+      if (persist) chromeSafe(() => chrome.storage.local.set({ overlayMinimized: on }));
+    }
+    function toggleMinimize() { setMinimized(!minimized); }
+
+    function updateBarToggle() {
+      const b = $('#ss-bar-toggle');
+      if (!b) return;
+      b.classList.toggle('ss-active', !hideSunoBar);
+      b.title = hideSunoBar ? "Show Suno's player bar" : "Hide Suno's player bar while shuffling";
+      b.setAttribute('aria-pressed', String(!hideSunoBar));
+    }
+
+    function setSource(name) {
+      const el = $('#ss-source');
+      if (!el) return;
+      el.textContent = name || '';
+      el.title = name || '';
+    }
+
+    function showPlayer() { ensure(); $('#ss-player').hidden = false; $('#ss-scan').hidden = true; root.classList.remove('ss-scanning'); }
+
+    function showScan(count, phase, expected) {
+      show();
+      $('#ss-player').hidden = true;
+      $('#ss-scan').hidden = false;
+      root.classList.add('ss-scanning');
+      $('#ss-scan-count').textContent = String(count);
+      $('#ss-scan-label').textContent = count === 1 ? 'song found' : 'songs found';
+      const status = {
+        scanning: 'Scrolling through the list…',
+        waiting: expected && count < expected
+          ? `Waiting for more to load (${count} of ${expected})…`
+          : 'Waiting for more songs to load…',
+        building: 'Shuffling…',
+      }[phase] || '';
+      $('#ss-scan-status').textContent = status;
+      // Only worth the space on long lists, or when loading more is clearly taking a while.
+      if (phase !== 'waiting') waitingSince = null;
+      else if (waitingSince === null) waitingSince = Date.now();
+      const slow = waitingSince !== null && Date.now() - waitingSince > 3000;
+      $('#ss-scan-hint').hidden = phase === 'building' || !(count >= 40 || slow);
+      $('#ss-cancel-scan').textContent = count > 0 ? `Stop scanning & play ${count}` : 'Stop scanning';
+      $('#ss-cancel-scan').disabled = phase === 'building';
+    }
+
+    function setSong(song, index, total) {
+      ensure();
+      showPlayer();
+      const t = $('#ss-song-title');
+      t.textContent = song.title; t.title = song.title;
+      $('#ss-sub').textContent = total ? `${index + 1} of ${total}` : '';
+      const img = $('#ss-img');
+      if (song.image_url) {
+        img.src = song.image_url; img.style.visibility = 'visible';
+        $('#ss-backdrop').style.backgroundImage = `url("${song.image_url.replace(/"/g, '%22')}")`;
+      } else {
+        img.removeAttribute('src'); img.style.visibility = 'hidden';
+        $('#ss-backdrop').style.backgroundImage = '';
+      }
+      setProgress(0, 0);
+    }
+
+    function setIdle(title, sub) {
+      ensure();
+      showPlayer();
+      $('#ss-song-title').textContent = title;
+      $('#ss-song-title').title = '';
+      $('#ss-sub').textContent = sub || '';
+      $('#ss-img').removeAttribute('src');
+      $('#ss-img').style.visibility = 'hidden';
+      $('#ss-backdrop').style.backgroundImage = '';
+      setProgress(0, 0);
+      setPlaying(false);
+      setUpNext(null);
+    }
+
+    function setPlaying(on) {
+      const b = $('#ss-play-pause');
+      if (!b) return;
+      b.innerHTML = on ? ICON.pause : ICON.play;
+      b.title = on ? 'Pause' : 'Play';
+      root.classList.toggle('ss-is-playing', on);
+    }
+
+    function setLoading(on) {
+      if (!root) return;
+      root.classList.toggle('ss-loading', on);
+    }
+
+    function setNotice(text, actionLabel, onAction) {
+      ensure();
+      const n = $('#ss-notice');
+      $('#ss-notice-text').textContent = text;
+      const btn = $('#ss-notice-action');
+      if (actionLabel && onAction) {
+        btn.hidden = false;
+        btn.textContent = actionLabel;
+        btn.onclick = onAction;
+      } else {
+        btn.hidden = true;
+        btn.onclick = null;
+      }
+      n.hidden = false;
+    }
+    function clearNotice() { if (root) $('#ss-notice').hidden = true; }
+
+    function setProgress(cur, dur) {
+      if (!root || dragging) return;
+      const ratio = dur > 0 ? Math.min(1, cur / dur) : 0;
+      root.style.setProperty('--ss-progress', (ratio * 100).toFixed(2) + '%');
+      $('#ss-time-cur').textContent = formatTime(cur);
+      $('#ss-time-dur').textContent = dur > 0 ? formatTime(dur) : '0:00';
+      $('#ss-progress-bar').setAttribute('aria-valuenow', String(Math.round(ratio * 100)));
+    }
+
+    function setUpNext(title, newCycle) {
+      const el = $('#ss-upnext');
+      if (!el) return;
+      if (!title && !newCycle) { el.hidden = true; return; }
+      el.hidden = false;
+      $('#ss-upnext-title').textContent = title || 'New shuffle cycle';
+      $('#ss-upnext-title').title = title || '';
+    }
+
+    function setVolume(v, muted) {
+      const s = $('#ss-volume-slider');
+      if (!s) return;
+      const shown = muted ? 0 : v;
+      s.value = String(Math.round(shown * 100));
+      s.style.setProperty('--ss-vol', Math.round(shown * 100) + '%');
+      $('#ss-mute').innerHTML = shown === 0 ? ICON.mute : ICON.vol;
+      $('#ss-mute').title = shown === 0 ? 'Unmute' : 'Mute';
+    }
+
+    function setupSeek(bar) {
+      function ratioAt(e) {
+        const r = bar.getBoundingClientRect();
+        return Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+      }
+      bar.addEventListener('pointerdown', (e) => {
+        const p = getPlayer();
+        if (!p || !isFinite(p.duration) || !p.duration) return;
+        e.preventDefault();
+        dragging = true;
+        bar.setPointerCapture(e.pointerId);
+        root.classList.add('ss-seeking');
+        const preview = (ev) => {
+          const ratio = ratioAt(ev);
+          root.style.setProperty('--ss-progress', (ratio * 100).toFixed(2) + '%');
+          $('#ss-time-cur').textContent = formatTime(ratio * p.duration);
+        };
+        preview(e);
+        const move = (ev) => preview(ev);
+        const up = (ev) => {
+          bar.removeEventListener('pointermove', move);
+          bar.removeEventListener('pointerup', up);
+          bar.removeEventListener('pointercancel', up);
+          dragging = false;
+          root.classList.remove('ss-seeking');
+          const pl = getPlayer();
+          if (pl && isFinite(pl.duration)) pl.currentTime = ratioAt(ev) * pl.duration;
+        };
+        bar.addEventListener('pointermove', move);
+        bar.addEventListener('pointerup', up);
+        bar.addEventListener('pointercancel', up);
+      });
+      bar.addEventListener('keydown', (e) => {
+        const p = getPlayer();
+        if (!p || !isFinite(p.duration)) return;
+        if (e.key === 'ArrowRight') { p.currentTime = Math.min(p.duration, p.currentTime + 5); e.preventDefault(); }
+        if (e.key === 'ArrowLeft')  { p.currentTime = Math.max(0, p.currentTime - 5); e.preventDefault(); }
+      });
+    }
+
+    return {
+      ensure, show, hide, showScan, showPlayer, setSong, setIdle, setPlaying, setLoading,
+      setNotice, clearNotice, setProgress, setUpNext, setVolume, setSource, updateBarToggle,
+      resetPosition, placeAt, get root() { return root; },
+    };
+  })();
 
   function makeDraggable(el, handle) {
-    let startX, startY, startLeft, startTop;
-    handle.addEventListener('mousedown', (e) => {
-      if (e.target.tagName === 'BUTTON') return;
+    handle.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 || e.target.closest('button')) return;
       e.preventDefault();
       const rect = el.getBoundingClientRect();
-      startX = e.clientX; startY = e.clientY;
-      startLeft = rect.left; startTop = rect.top;
+      const startX = e.clientX, startY = e.clientY;
+      const startLeft = rect.left, startTop = rect.top;
+      el.classList.add('ss-dragging');
 
-      function onMove(e) {
-        const newLeft = Math.max(0, Math.min(window.innerWidth  - el.offsetWidth,  startLeft + e.clientX - startX));
-        const newTop  = Math.max(0, Math.min(window.innerHeight - el.offsetHeight, startTop  + e.clientY - startY));
-        el.style.left = newLeft + 'px'; el.style.top = newTop + 'px';
-        el.style.right = 'auto'; el.style.bottom = 'auto';
+      function onMove(ev) {
+        ui.placeAt(startLeft + ev.clientX - startX, startTop + ev.clientY - startY);
       }
       function onUp() {
-        document.removeEventListener('mousemove', onMove);
-        document.removeEventListener('mouseup', onUp);
+        document.removeEventListener('pointermove', onMove);
+        document.removeEventListener('pointerup', onUp);
+        el.classList.remove('ss-dragging');
         chromeSafe(() => chrome.storage.local.set({ overlayPos: { x: parseInt(el.style.left), y: parseInt(el.style.top) } }));
       }
-      document.addEventListener('mousemove', onMove);
-      document.addEventListener('mouseup', onUp);
+      document.addEventListener('pointermove', onMove);
+      document.addEventListener('pointerup', onUp);
     });
-  }
-
-  // ─── UI helpers ────────────────────────────────────────────────────────────
-
-  function toggleMinimize() {
-    overlayMinimized = !overlayMinimized;
-    overlay.classList.toggle('ss-minimized', overlayMinimized);
-    overlay.querySelector('#ss-minimize').textContent = overlayMinimized ? '+' : '\u2212';
-    chromeSafe(() => chrome.storage.local.set({ overlayMinimized }));
-  }
-
-  function setScanningUI(scanning) {
-    if (!overlay) return;
-    const controls   = overlay.querySelector('#ss-controls');
-    const cancelBtn  = overlay.querySelector('#ss-cancel-scan');
-    if (controls)  controls.style.display  = scanning ? 'none' : 'flex';
-    if (cancelBtn) cancelBtn.style.display = scanning ? 'block' : 'none';
-  }
-
-  function setSpinner(on) {
-    if (spinnerEl) spinnerEl.style.display = on ? 'block' : 'none';
-    if (imgEl) imgEl.style.opacity = on ? '0.3' : '1';
-  }
-
-  function setOverlayStatus(text) {
-    if (titleEl) titleEl.textContent = text;
   }
 
   function formatTime(secs) {
-    if (!isFinite(secs)) return '0:00';
+    if (!isFinite(secs) || secs < 0) return '0:00';
     const m = Math.floor(secs / 60);
     const s = Math.floor(secs % 60).toString().padStart(2, '0');
     return `${m}:${s}`;
@@ -426,39 +708,41 @@
 
   function updateProgress() {
     const p = getPlayer();
-    if (!p || !p.duration || !isFinite(p.duration)) return;
-    const ratio = p.currentTime / p.duration;
-    if (progressFill) progressFill.style.width = (ratio * 100) + '%';
-    if (timeEl) timeEl.textContent = formatTime(p.currentTime) + ' / ' + formatTime(p.duration);
+    if (!p || externalTakeover) return;
+    ui.setProgress(p.currentTime, isFinite(p.duration) ? p.duration : 0);
   }
 
   function startProgressTracking() {
     if (progressInterval) clearInterval(progressInterval);
-    progressInterval = setInterval(updateProgress, 500);
+    progressInterval = setInterval(updateProgress, 250);
+    updateProgress();
   }
 
   function stopProgressTracking() {
     if (progressInterval) { clearInterval(progressInterval); progressInterval = null; }
   }
 
-  function setCurrentSongUI(song, index, total) {
-    if (!overlay) return;
-    if (titleEl)      { titleEl.textContent = song.title; titleEl.title = song.title; }
-    if (counterEl)    counterEl.textContent = `${index + 1} / ${total}`;
-    if (progressFill) progressFill.style.width = '0%';
-    if (timeEl)       timeEl.textContent = '0:00';
-    if (playPauseBtn) playPauseBtn.textContent = '\u23f8';
-    if (imgEl) {
-      if (song.image_url) { imgEl.src = song.image_url; imgEl.style.display = 'block'; }
-      else imgEl.style.display = 'none';
+  function toggleSunoBar() {
+    hideSunoBar = !hideSunoBar;
+    chromeSafe(() => chrome.storage.local.set({ hideSunoBar }));
+    ui.updateBarToggle();
+    applyBarVisibility();
+  }
+
+  function toggleMute() {
+    const p = getPlayer();
+    if (!p) return;
+    if (p.muted || p.volume === 0) {
+      p.muted = false;
+      if (p.volume === 0) p.volume = savedVolume || 0.8;
+    } else {
+      p.muted = true;
     }
   }
 
-  function seekTo(e) {
-    const p = getPlayer();
-    if (!p || !p.duration || !isFinite(p.duration)) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    p.currentTime = ((e.clientX - rect.left) / rect.width) * p.duration;
+  async function refreshUpNext() {
+    const r = await sendMessage({ type: 'PEEK_NEXT' });
+    ui.setUpNext(r?.song?.title || null, !!r?.newCycle);
   }
 
   // ─── Playback (via Suno's player) ──────────────────────────────────────────
@@ -489,20 +773,16 @@
     return null;
   }
 
+  /** Play buttons on a song's own page (the big "Play" next to the title). */
   function songPlayButtons() {
     return [...document.querySelectorAll('button[aria-label="Play"]')].filter(b => !b.closest('#ss-overlay'));
-  }
-
-  function isPlayingNewSource(prevSrc) {
-    const p = getPlayer();
-    return !!(p && !p.paused && p.currentSrc && p.currentSrc !== prevSrc);
   }
 
   /** The row cover button ("Play <title>") of a song rendered in a list on this page. */
   function findRowPlayButton(id) {
     for (const a of document.querySelectorAll(`a[href*="/song/${id}"]`)) {
       if (a.closest('#ss-overlay')) continue;
-      const b = findSongRow(a, id).querySelector('[role="button"][aria-label^="Play "]');
+      const b = findSongRow(a, id).querySelector(ROW_PLAY_SEL);
       if (b) return b;
     }
     return null;
@@ -543,7 +823,7 @@
   /** Client-side navigate. Resolves 'ok' | 'failed' | 'reload' | 'stale'. */
   async function softNavigate(path, gen) {
     const navOk = await routerNavigate(path);
-    log('navigate', path, navOk ? 'via router' : 'router unavailable \u2192 full load');
+    log('navigate', path, navOk ? 'via router' : 'router unavailable → full load');
     if (gen !== playGen) return 'stale';
     if (!navOk) { location.assign(path); return 'reload'; }
     return await waitFor(() => location.pathname === path, 6000) ? 'ok' : 'failed';
@@ -616,7 +896,7 @@
     for (let attempt = 0; attempt < 2; attempt++) {
       const prevSrc = getPlayer()?.currentSrc || '';
       suppressForeignPlay = false;
-      log('pressing Play for', song.id, '\u2014', found.how, attempt ? '(retry)' : '');
+      log('pressing Play for', song.id, '—', found.how, attempt ? '(retry)' : '');
       btn.click();
       const ok = await waitFor(() => {
         if (gen !== playGen) return true;
@@ -642,9 +922,16 @@
     currentIndex = index;
     currentTotal = total;
     awaitingGesture = false;
+    externalTakeover = false;
+    pendingResume = false;
     starting = true;
-    setSpinner(true);
-    setCurrentSongUI(song, index, total);
+    applyBarVisibility();
+    ui.show();
+    ui.clearNotice();
+    ui.setSong(song, index, total);
+    ui.setPlaying(true);
+    ui.setLoading(true);
+    refreshUpNext();
 
     let result;
     try {
@@ -658,36 +945,34 @@
     if (result === 'reload') return;   // page is reloading; the AUTOPLAY_KEY marker takes over
     starting = false;
     suppressForeignPlay = false;
-    setSpinner(false);
+    ui.setLoading(false);
     chromeSafe(() => chrome.storage.local.remove(AUTOPLAY_KEY));
 
     if (result === 'playing') {
+      consecutiveFailures = 0;
       const p = getPlayer();
+      ourSrc = p?.currentSrc || null;
       if (p && savedVolume != null) p.volume = savedVolume;
+      ui.setPlaying(true);
       startProgressTracking();
     } else if (result === 'blocked') {
       awaitingGesture = true;
-      if (playPauseBtn) playPauseBtn.textContent = '▶';
-      if (titleEl) titleEl.textContent = song.title + ' — press ▶ to start';
-    } else if (result === 'failed') {
+      ui.setPlaying(false);
+      ui.setNotice('Chrome blocked autoplay.', 'Play', togglePlayPause);
+    } else {
       // Don't silently burn through the whole queue if Suno's page structure changed again.
       consecutiveFailures++;
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         consecutiveFailures = 0;
         awaitingGesture = true;
-        if (playPauseBtn) playPauseBtn.textContent = '▶';
-        if (titleEl) titleEl.textContent = 'Could not start Suno’s player — press ▶ to retry';
+        ui.setPlaying(false);
+        ui.setNotice('Couldn’t start Suno’s player.', 'Retry', togglePlayPause);
         return;
       }
       console.warn('[SunoShuffle] Could not start song on Suno player, skipping:', song.id);
       advanceQueue();
-      return;
     }
-    if (result === 'playing') consecutiveFailures = 0;
   }
-
-  const MAX_CONSECUTIVE_FAILURES = 3;
-  let consecutiveFailures = 0;
 
   function advanceQueue() {
     if (!shuffleActive) return;
@@ -697,21 +982,20 @@
         if (chrome.runtime.lastError || !response) {
           // Don't leave skip/prev locked forever if the background didn't answer.
           navigating = false;
-          setSpinner(false);
-          setOverlayStatus('Could not get the next song — press ⏭ to retry');
+          ui.setLoading(false);
+          ui.setNotice('Couldn’t get the next song.', 'Retry', skipSong);
           return;
         }
         if (response.done) {
           // Queue exhausted — reshuffle the same song list for a new cycle
-          setOverlayStatus('Reshuffling…');
           chrome.runtime.sendMessage({ type: 'RESHUFFLE_STORED' }, (res) => {
             if (!shuffleActive) return;
             if (res?.song) {
               playSong(res.song, res.index, res.total);
             } else {
               navigating = false;
-              setOverlayStatus('All songs played. Press Start Shuffle to scan again.');
-              shuffleActive = false;
+              setActive(false);
+              ui.setIdle('All songs played', 'Start a new shuffle from the extension');
             }
           });
         } else {
@@ -719,6 +1003,33 @@
         }
       });
     });
+  }
+
+  // ─── Takeover: the user started something else in Suno ────────────────────
+
+  function checkTakeover() {
+    if (!shuffleActive || starting || externalTakeover || !currentSong) return;
+    const p = getPlayer();
+    if (!p || p.paused) return;
+    const barId = getPlaybarSongId();
+    const foreign = barId
+      ? barId !== currentSong.id
+      : !!(ourSrc && p.currentSrc && p.currentSrc !== ourSrc);
+    if (foreign) enterTakeover();
+  }
+
+  function enterTakeover() {
+    log('user started another song in Suno — pausing shuffle');
+    externalTakeover = true;
+    stopProgressTracking();
+    applyBarVisibility();      // give Suno's bar back while they listen to their own pick
+    ui.setPlaying(false);
+    ui.setProgress(0, 0);
+    ui.setNotice('Playing your own pick. Shuffle paused.', 'Resume', resumeShuffle);
+  }
+
+  function resumeShuffle() {
+    if (currentSong) playSong(currentSong, currentIndex, currentTotal);
   }
 
   // ─── Controls ──────────────────────────────────────────────────────────────
@@ -730,37 +1041,30 @@
       chromeSafe(() => {
         chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (status) => {
           if (status?.currentSong) {
-            shuffleActive = true;
+            setActive(true);
             playSong(status.currentSong, Math.max(0, status.queueIndex - 1), status.queueLength);
           }
         });
       });
       return;
     }
-    if (awaitingGesture && currentSong) {
-      // This click is a real user gesture, so Suno's player is now allowed to start.
-      playSong(currentSong, currentIndex, currentTotal);
+    if ((awaitingGesture || externalTakeover) && currentSong) {
+      // A real click: Suno's player is now allowed to start.
+      resumeShuffle();
       return;
     }
     const p = getPlayer();
     if (!p) return;
     if (p.paused) {
       p.play().catch(() => {});
-      if (playPauseBtn) playPauseBtn.textContent = '\u23f8';
+      ui.setPlaying(true);
       startProgressTracking();
     } else {
       p.pause();
-      if (playPauseBtn) playPauseBtn.textContent = '\u25b6';
+      ui.setPlaying(false);
       stopProgressTracking();
     }
   }
-
-  // navigating + playGen together prevent concurrent queue advances.
-  // navigating blocks new skip/prev clicks while one is in-flight.
-  // playGen is incremented on every skip/prev/playSong so that stale
-  // .catch() / error callbacks from interrupted plays are silently ignored.
-  let navigating = false;
-  let playGen    = 0;
 
   function skipSong() {
     if (!shuffleActive || navigating) return;
@@ -768,15 +1072,23 @@
     suppressForeignPlay = true;
     playGen++;              // invalidate any in-flight start of the previous song
     stopProgressTracking();
+    ui.clearNotice();
     advanceQueue();
   }
 
   function prevSong() {
     if (!shuffleActive || navigating) return;
+    // Like most players: past the first few seconds, "previous" restarts the song.
+    const p = getPlayer();
+    if (p && !externalTakeover && !starting && p.currentTime > 4) {
+      p.currentTime = 0;
+      return;
+    }
     navigating = true;
     suppressForeignPlay = true;
     playGen++;
     stopProgressTracking();
+    ui.clearNotice();
     chromeSafe(() => {
       chrome.runtime.sendMessage({ type: 'STEP_BACK' }, (resp) => {
         if (chrome.runtime.lastError) { navigating = false; return; }
@@ -784,93 +1096,77 @@
           playSong(resp.song, resp.index, resp.total);
         } else {
           navigating = false;
+          suppressForeignPlay = false;
         }
       });
     });
   }
 
-  // Stop = pause the current song and rewind to the beginning.
-  // The queue stays intact; pressing play resumes from the start of the song.
-  function stopCurrentSong() {
-    if (!overlay) return;
-    const p = getPlayer();
-    if (p) { p.pause(); p.currentTime = 0; }
-    stopProgressTracking();
-    if (progressFill) progressFill.style.width = '0%';
-    if (timeEl)       timeEl.textContent = '0:00';
-    if (playPauseBtn) playPauseBtn.textContent = '\u25b6';
-  }
-
   function stopShuffle() {
-    shuffleActive = false;
+    setActive(false);
     navigating = false;
     starting = false;
     awaitingGesture = false;
+    externalTakeover = false;
     suppressForeignPlay = false;
     playGen++;
     chromeSafe(() => chrome.storage.local.remove(AUTOPLAY_KEY));
     const p = getPlayer();
     if (p && !p.paused) p.pause();
     stopProgressTracking();
-    setSpinner(false);
+    ui.setLoading(false);
     currentSong = null;
-    if (overlay) {
-      setOverlayStatus('Shuffle stopped');
-      if (counterEl)    counterEl.textContent   = '\u2014';
-      if (progressFill) progressFill.style.width = '0%';
-      if (timeEl)       timeEl.textContent       = '0:00';
-      if (playPauseBtn) playPauseBtn.textContent  = '\u25b6';
-      if (imgEl)        imgEl.src                 = '';
-    }
+  }
+
+  /** ✕ in the overlay: stop, hide, and keep the queue for "Resume" in the popup. */
+  function closeShuffle() {
+    stopShuffle();
+    ui.hide();
+    chromeSafe(() => chrome.storage.local.set({ overlayClosed: true }));
   }
 
   // ─── Main start flow ───────────────────────────────────────────────────────
 
   async function startShuffle() {
-    shuffleActive = true;
+    setActive(true);
+    playGen++;
+    stopProgressTracking();
     sourcePath = location.pathname;
-    chromeSafe(() => chrome.storage.local.set({ sourcePath }));
-    createOverlay();
-    overlay.style.display = 'block';
+    sourceName = pageTitleName();
+    await storageSet({ sourcePath, sourceName, overlayClosed: false });
+    ui.ensure();
+    ui.setSource(sourceName);
+    ui.clearNotice();
 
     const songs = await loadAllSongsFromCurrentPage();
 
     if (!songs || songs.length === 0) {
-      setOverlayStatus('No songs found on this page.');
-      shuffleActive = false;
-      return { success: false, error: 'No songs found on this page. Navigate to your Liked songs on suno.com/me first.' };
+      setActive(false);
+      ui.setIdle('No songs found here', 'Open a playlist or your Liked songs');
+      return { success: false, error: 'No songs found on this page. Open a playlist or your Liked songs, then try again.' };
     }
 
-    setOverlayStatus(`Building queue from ${songs.length} songs\u2026`);
+    ui.showScan(songs.length, 'building');
+    const res = await sendMessage({ type: 'BUILD_QUEUE', songs });
+    if (!res?.success) {
+      setActive(false);
+      ui.setIdle('Couldn’t build the queue', res?.error || '');
+      return { success: false, error: res?.error || 'Could not build queue' };
+    }
 
-    return new Promise((resolve) => {
-      chromeSafe(() => {
-        chrome.runtime.sendMessage({ type: 'BUILD_QUEUE', songs }, (res) => {
-          if (!res?.success) {
-            setOverlayStatus('Error: ' + (res?.error || 'Could not build queue'));
-            shuffleActive = false;
-            resolve({ success: false, error: res?.error });
-            return;
-          }
-
-          chrome.runtime.sendMessage({ type: 'GET_NEXT_SONG' }, (resp) => {
-            if (resp?.song) {
-              playSong(resp.song, resp.index, resp.total);
-              resolve({ success: true, count: res.count, total: res.total });
-            } else {
-              setOverlayStatus('No songs to play.');
-              shuffleActive = false;
-              resolve({ success: false, error: 'Empty queue' });
-            }
-          });
-        });
-      });
-    });
+    const resp = await sendMessage({ type: 'GET_NEXT_SONG' });
+    if (!resp?.song) {
+      setActive(false);
+      ui.setIdle('Nothing to play', '');
+      return { success: false, error: 'Empty queue' };
+    }
+    playSong(resp.song, resp.index, resp.total);
+    return { success: true, count: res.count, total: res.total };
   }
 
   // ─── Audio events ──────────────────────────────────────────────────────────
 
-  // Media events don't bubble, but they do pass through the capture phase \u2014 listening on
+  // Media events don't bubble, but they do pass through the capture phase — listening on
   // document keeps working even if Suno replaces its <audio> element.
   function onPlayerEvent(type, handler) {
     document.addEventListener(type, (e) => {
@@ -879,33 +1175,41 @@
   }
 
   onPlayerEvent('ended', () => {
-    if (shuffleActive && !navigating && !starting && currentSong) {
+    if (shuffleActive && !navigating && !starting && !externalTakeover && currentSong) {
       suppressForeignPlay = true;   // block Suno's own auto-advance immediately
       advanceQueue();
     }
   });
   onPlayerEvent('pause', () => {
-    if (!shuffleActive || starting) return;
-    if (playPauseBtn) playPauseBtn.textContent = '\u25b6';
+    if (!shuffleActive || starting || externalTakeover) return;
+    ui.setPlaying(false);
   });
   onPlayerEvent('play', (p) => {
     if (!shuffleActive) return;
     if (suppressForeignPlay) { p.pause(); return; }
-    if (playPauseBtn) playPauseBtn.textContent = '\u23f8';
+    if (starting || externalTakeover) return;
+    ui.setPlaying(true);
     startProgressTracking();
+    setTimeout(checkTakeover, 700);   // let Suno's bar catch up with what's playing
   });
   onPlayerEvent('volumechange', (p) => {
-    if (volumeSlider && !starting) volumeSlider.value = Math.round(p.volume * 100);
+    if (!starting) ui.setVolume(p.volume, p.muted);
   });
   onPlayerEvent('error', () => {
-    if (!shuffleActive || starting) return;
+    if (!shuffleActive || starting || externalTakeover) return;
     const gen = playGen;
-    console.warn('[SunoShuffle] Suno player error, skipping in 1s\u2026');
+    console.warn('[SunoShuffle] Suno player error, skipping in 1s…');
     setTimeout(() => {
-      // Ignore if a newer song already started (gen changed) or a skip is in-flight
       if (gen !== playGen || !shuffleActive || navigating || starting) return;
       advanceQueue();
     }, 1000);
+  });
+
+  // Keyboard media keys (next / previous), forwarded by page-bridge.js while shuffling.
+  window.addEventListener('message', (e) => {
+    if (e.source !== window || !e.data || e.data.__ssBridge !== 'media' || !shuffleActive) return;
+    if (e.data.action === 'nexttrack') skipSong();
+    else if (e.data.action === 'previoustrack') prevSong();
   });
 
   // ─── Message listeners ─────────────────────────────────────────────────────
@@ -923,9 +1227,11 @@
       chromeSafe(() => {
         chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (status) => {
           if (status?.currentSong) {
-            shuffleActive = true;
-            createOverlay();
-            overlay.style.display = 'block';
+            if (status.sourceName) { sourceName = status.sourceName; }
+            chrome.storage.local.set({ overlayClosed: false });
+            setActive(true);
+            ui.ensure();
+            ui.setSource(sourceName);
             playSong(status.currentSong, Math.max(0, status.queueIndex - 1), status.queueLength);
             sendResponse({ success: true });
           } else {
@@ -938,7 +1244,7 @@
 
     if (message.type === 'CONTENT_STOP') {
       stopShuffle();
-      if (overlay) overlay.style.display = 'none';
+      ui.hide();
       sendResponse({ success: true });
     }
 
@@ -948,12 +1254,7 @@
     }
 
     if (message.type === 'RESET_OVERLAY_POS') {
-      if (overlay) {
-        overlay.style.left   = '';
-        overlay.style.top    = '';
-        overlay.style.right  = '24px';
-        overlay.style.bottom = '24px';
-      }
+      ui.resetPosition();
       sendResponse({ success: true });
     }
 
@@ -962,54 +1263,38 @@
     }
   });
 
-  // ─── Restore overlay on page navigation ───────────────────────────────────
+  // ─── Restore on page load ──────────────────────────────────────────────────
 
   chromeSafe(() => {
-    chrome.storage.local.get(['queue', 'currentSong', 'queueIndex', 'sourcePath', AUTOPLAY_KEY], (data) => {
+    chrome.storage.local.get(['queue', 'currentSong', 'queueIndex', 'sourcePath', 'sourceName', 'overlayClosed', AUTOPLAY_KEY], (data) => {
       if (!data) return;
       if (data.sourcePath && !sourcePath) sourcePath = data.sourcePath;
+      if (data.sourceName && !sourceName) sourceName = data.sourceName;
+      const total = (data.queue || []).length;
+      const index = Math.max(0, (data.queueIndex || 1) - 1);
 
       // A song switch turned into a full page reload: keep the shuffle going.
       const ap = data[AUTOPLAY_KEY];
       if (ap) chrome.storage.local.remove(AUTOPLAY_KEY);
-      if (ap && data.currentSong && ap.id === data.currentSong.id &&
-          Date.now() - ap.at < AUTOPLAY_TTL) {
+      if (ap && data.currentSong && ap.id === data.currentSong.id && Date.now() - ap.at < AUTOPLAY_TTL) {
         log('page reloaded mid-switch — resuming', ap.id);
         consecutiveFailures = ap.failures || 0;
-        shuffleActive = true;
-        createOverlay();
-        overlay.style.display = 'block';
-        playSong(data.currentSong, Math.max(0, (data.queueIndex || 1) - 1), (data.queue || []).length);
+        setActive(true);
+        ui.ensure();
+        ui.setSource(sourceName);
+        playSong(data.currentSong, index, total);
         return;
       }
 
-      if (data.currentSong || (data.queue && data.queue.length > 0)) {
-        createOverlay();
-        if (data.currentSong) {
-          pendingResume = true;
-          if (playPauseBtn) playPauseBtn.textContent = '\u25b6';
-          if (titleEl) { titleEl.textContent = data.currentSong.title + ' (paused)'; }
-          if (data.queue && counterEl) counterEl.textContent = `\u2014 / ${data.queue.length}`;
-          if (data.currentSong.image_url && imgEl) {
-            imgEl.src = data.currentSong.image_url;
-            imgEl.style.display = 'block';
-          }
-        }
+      if (data.currentSong && !data.overlayClosed) {
+        pendingResume = true;
+        ui.ensure();
+        ui.setSource(sourceName);
+        ui.setSong(data.currentSong, index, total);
+        ui.setPlaying(false);
+        refreshUpNext();
       }
     });
   });
-
-  // ─── Utilities ─────────────────────────────────────────────────────────────
-
-  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-  function storageSet(obj) {
-    return new Promise((resolve) => {
-      try {
-        if (!chrome.runtime?.id) return resolve();
-        chrome.storage.local.set(obj, () => resolve());
-      } catch (e) { resolve(); }
-    });
-  }
 
 })();

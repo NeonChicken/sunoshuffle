@@ -189,14 +189,26 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // ── GET_STATUS ────────────────────────────────────────────────────────────
   if (message.type === 'GET_STATUS') {
     (async () => {
-      const stored = await chrome.storage.local.get(['queue', 'queueIndex', 'currentSong', 'totalSongs', 'queueCycle']);
+      const stored = await chrome.storage.local.get(['queue', 'queueIndex', 'currentSong', 'totalSongs', 'queueCycle', 'sourceName']);
       sendResponse({
         queueLength: (stored.queue || []).length,
         queueIndex: stored.queueIndex || 0,
         currentSong: stored.currentSong || null,
         totalSongs: stored.totalSongs || 0,
         queueCycle: stored.queueCycle || 0,
+        sourceName: stored.sourceName || null,
       });
+    })();
+    return true;
+  }
+
+  // ── PEEK_NEXT — the song that GET_NEXT_SONG would hand out (for "Up next") ─
+  if (message.type === 'PEEK_NEXT') {
+    (async () => {
+      const stored = await chrome.storage.local.get(['queue', 'queueIndex']);
+      const queue = stored.queue || [];
+      const index = stored.queueIndex || 0;
+      sendResponse({ song: queue[index] || null, newCycle: queue.length > 0 && index >= queue.length });
     })();
     return true;
   }
@@ -204,7 +216,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // ── CLEAR_QUEUE ───────────────────────────────────────────────────────────
   if (message.type === 'CLEAR_QUEUE') {
     chrome.storage.local.remove(
-      ['queue', 'songsPool', 'queueIndex', 'playedIds', 'currentSong', 'totalSongs', 'queueCycle', 'lastUpdated'],
+      ['queue', 'songsPool', 'queueIndex', 'playedIds', 'currentSong', 'totalSongs', 'queueCycle', 'lastUpdated',
+       'sourcePath', 'sourceName', 'ssAutoplay', 'overlayClosed'],
       () => sendResponse({ success: true })
     );
     return true;

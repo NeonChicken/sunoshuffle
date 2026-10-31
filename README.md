@@ -5,10 +5,12 @@ A Chrome extension that intelligently shuffles your Suno liked songs with a pers
 ## Features
 
 - **Intelligent shuffle** — no two consecutive songs with the same base name. Strips `(Edit)`, `(FAV)`, and `(ULTRAFAV)` suffixes before comparing, so variations of the same song are never played back-to-back.
-- **Full library scan** — auto-scrolls your liked songs page to load every song before shuffling, including those hidden behind lazy loading.
+- **Full list scan** — auto-scrolls the playlist (or your Liked songs) and waits for more songs to load at the bottom, so long lists are picked up completely.
 - **Persistent queue** — your position in the queue is saved across browser restarts. Recently played songs won't repeat until the entire library has been heard.
 - **Cycle tracking** — keeps track of how many times you've cycled through your full library.
-- **Floating player overlay** — draggable player with play/pause, skip, previous, progress bar, and cover art. Minimizable and position is remembered.
+- **Player overlay** — replaces Suno's bottom player bar while shuffling: cover art, seekable progress, play/pause, next/previous, volume and what's up next. Draggable, minimizable to a single row, position remembered. Suno's bar can be shown again with the toggle in the overlay header.
+- **Media keys** — keyboard next/previous keys go through the shuffle instead of Suno's own queue.
+- **Plays nice with Suno** — start a song yourself in Suno and the shuffle pauses (with a *Resume* button) instead of fighting you.
 
 ## Installation
 
@@ -21,8 +23,9 @@ A Chrome extension that intelligently shuffles your Suno liked songs with a pers
 
 1. Go to [suno.com/playlist/liked](https://suno.com/playlist/liked).
 2. Click the Suno Shuffle icon in your Chrome toolbar.
-3. Click **Start Shuffle** — the extension will scan all your liked songs by auto-scrolling the page, then start playing. Note: it's better if you load the entire page yourself beforehand.
-4. Use the floating overlay to control playback from any suno.com page.
+3. Click **Shuffle this page** — the extension scans the list by auto-scrolling, then starts playing.
+   Tip: on long lists, scroll to the bottom yourself first so every song is loaded; the scan is then almost instant.
+4. Use the overlay to control playback. You can browse other Suno pages; the next song switches back to your list.
 
 ### Resuming after closing Chrome
 
@@ -30,11 +33,11 @@ Open any `suno.com` page, click the extension icon, and hit **Resume**. The queu
 
 ### Re-shuffle
 
-Click **Re-shuffle** in the popup to re-randomize the remaining unplayed songs in the current cycle without losing your played history.
+Press **Shuffle this page** again to rescan and re-randomize. Songs already played in the current cycle are skipped until the whole list has been heard.
 
 ### Clear history
 
-Click **Clear queue & history** to wipe everything and start fresh on your next **Start Shuffle**.
+Click **Clear history** to wipe everything and start fresh on your next **Start Shuffle**.
 
 ## How the shuffle works
 
